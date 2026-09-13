@@ -25,21 +25,21 @@
 
 ## 1. 实际泄露了什么
 
-| 类别 | 值 | 出现在 |
+| 类别 | 数量 | 出现在 |
 |---|---|---|
-| 多维表格 app_token | `INwvb2e4…` | 7 处（docs + `scripts/pipeline.sh`） |
-| wiki 节点 token | `FSgOwMpL…` | 6 处 |
-| 表 ID ×4+ | `tblO66uw…` `tblyNZ08…` `tblwLO0A…` 等 | docs + 帮助文本 |
-| 审批定义 code ×3 | `4DB677CD…` `7A8FAB9F…` `454EB37A…` | docs + `cmd/serve/main.go` + **二进制** |
-| 租户域名 | `<TENANT>.feishu.cn` | 7 处 |
-| 管理员 user id | `51b3ged6` | 4 处 |
-| 部门 open id | `od-f65826b7…` | 2 处 |
-| 本应用 app_id | `cli_aa2fad7e…` | 6 处 |
-| 真实审批实例号 ×4 | `F8A241DD…` 等 | docs |
-| 真实发票号 ×3 | `26322000003058683826` 等 | docs + 注释 |
+| 多维表格 app_token | 7 处 | docs + `scripts/pipeline.sh` |
+| wiki 节点 token | 6 处 | docs |
+| 表 ID（4 个以上） | 11 处 | docs + 帮助文本 |
+| 审批定义 code（3 个） | 8 处 | docs + `cmd/serve/main.go` + **二进制** |
+| 租户域名 | 7 处 | docs |
+| 管理员 user id | 4 处 | docs |
+| 部门 open id | 2 处 | docs |
+| 本应用 app_id | 6 处 | docs |
+| 真实审批实例号（4 个） | 4 处 | docs |
+| 真实发票号（3 个） | 4 处 | docs + 代码注释 |
 
-这些**单独不足以访问数据**（调用飞书 API 还需要 app_secret），但仓库公开就意味着
-组织内部结构（表名、审批名、管理员 ID、租户域名）对外可见。清掉是对的。
+> 本文档本身也**不写这些值** —— 第一次写这篇文档时我把它们列了出来，
+> 结果被自己的远程复验脚本抓到（见 §3.6）。
 
 ---
 
@@ -82,7 +82,7 @@
 `<APPROVAL_CODE>` / `<INSTANCE_A>` / `<DEPT_ID>` / `<ADMIN_USER_ID>` / `<TENANT>.feishu.cn`。
 
 共修改 25 个文件。做的是**两遍**扫描：第一遍精确匹配，第二遍才发现
-`4DB677CD-...` 这类**截断形式**漏了 —— 只做一遍会以为清干净了。
+`<APPROVAL_CODE>-...` 这类**截断形式**漏了 —— 只做一遍会以为清干净了。
 
 ### 3.3 历史重写
 
@@ -132,7 +132,7 @@ $ ls -d data                      → 不存在
 |---|---|
 | 强行 `git add -f config.yml` | ✗ 拒绝 |
 | 含 `sk-abc…` 的假密钥 | ✗ 拒绝 |
-| 含 `tblO66uw…` 表 ID | ✗ 拒绝 |
+| 含真实表 ID | ✗ 拒绝 |
 | 正常改动 | ✓ 放行 |
 
 启用（每个 clone 一次）：`git config core.hooksPath .githooks`
