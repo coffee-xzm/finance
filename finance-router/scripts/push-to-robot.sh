@@ -21,8 +21,17 @@ BRANCH="${BRANCH:-main}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO"
 
-# 是否需要密码由 ssh/scp 自己决定；有 sshpass 就提示用法
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10)
+
+# 有 SSHPASS 环境变量且装了 sshpass，就走密码认证（否则用密钥/agent）。
+# 注意：scp/ssh 本身不读 SSHPASS，必须由 sshpass 包一层。
+if [ -n "${SSHPASS:-}" ] && command -v sshpass >/dev/null 2>&1; then
+    SSH=(sshpass -e ssh)
+    SCP=(sshpass -e scp)
+else
+    SSH=(ssh)
+    SCP=(scp)
+fi
 
 echo "→ 目标: $ROBOT:$REPO_DIR  (分支 $BRANCH)"
 
@@ -42,12 +51,12 @@ git bundle create "$TMP_BUNDLE" "$BRANCH" >/dev/null
 echo "→ bundle $(du -h "$TMP_BUNDLE" | cut -f1)"
 trap 'rm -f "$TMP_BUNDLE"' EXIT
 
-scp "${SSH_OPTS[@]}" "$TMP_BUNDLE" "$ROBOT:/tmp/finance-push.bundle"
+"${SCP[@]}" "${SSH_OPTS[@]}" "$TMP_BUNDLE" "$ROBOT:/tmp/finance-push.bundle"
 echo "→ 已传输"
 
 # ── 3. 目标机取新历史并重置 ────────────────────────────────
 # 用 fetch+reset 而不是 pull：历史可能被重写过，ff-only 会失败。
-ssh "${SSH_OPTS[@]}" "$ROBOT" bash -s <<REMOTE
+"${SSH[@]}" "${SSH_OPTS[@]}" "$ROBOT" bash -s <<REMOTE
 set -e
 cd "$REPO_DIR"
 git fetch --force /tmp/finance-push.bundle "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" 2>&1 | tail -2
@@ -59,9 +68,9 @@ REMOTE
 
 # ── 4. 重启并健康检查 ──────────────────────────────────────
 echo "→ 重启服务"
-ssh "${SSH_OPTS[@]}" "$ROBOT" "$REPO_DIR/finance-router/scripts/serve-ctl.sh restart"
+"${SSH[@]}" "${SSH_OPTS[@]}" "$ROBOT" "$REPO_DIR/finance-router/scripts/serve-ctl.sh restart"
 sleep 3
-ssh "${SSH_OPTS[@]}" "$ROBOT" "$REPO_DIR/finance-router/scripts/serve-ctl.sh status"
+"${SSH[@]}" "${SSH_OPTS[@]}" "$ROBOT" "$REPO_DIR/finance-router/scripts/serve-ctl.sh status"
 
 echo
 echo "✓ 推送完成: $REV"
