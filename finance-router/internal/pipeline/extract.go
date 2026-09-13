@@ -891,7 +891,7 @@ func printMatch(r *match.Report) {
 // Lark 品牌下为 cli_9c7cc8a9a9edd105。**它对所有租户都一样**，
 // 是平台公开常量，不是本项目的 app_id（那个在 config.yml 里、repo 公开故不入库）。
 // 可用 config 的 feishu.approval_app_id 覆盖（Lark 品牌需要）。
-var approvalAppID = "cli_9cb844403dbb9108"   // 飞书品牌；Lark 品牌见 config 的 approval_app_id
+var approvalAppID = "cli_9cb844403dbb9108" // 飞书品牌；Lark 品牌见 config 的 approval_app_id
 
 // resolveApprovalAppID 允许 config 覆盖上面的平台默认值。
 func resolveApprovalAppID(cfg *config.Config) string {
