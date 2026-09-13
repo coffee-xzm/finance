@@ -1,0 +1,55 @@
+#!/bin/bash
+# pre-commit —— 拦住"配置/密钥/租户标识符"进仓库
+#
+# 为什么需要：这个仓库是**公开**的。config.yml 里有 app_secret 和 OCR api_key，
+# 一旦提交就是永久泄露（即使之后删除，历史里还在）。
+# 2026-09-13 曾出现租户标识符散落在文档与脚本中的情况，靠事后清理才发现。
+#
+# 安装（每个 clone 一次）：
+#     git config core.hooksPath .githooks
+#     chmod +x .githooks/pre-commit
+#
+# 临时跳过（确认安全时）：git commit --no-verify
+set -uo pipefail
+
+fail() { echo "" >&2; echo "✗ 提交被拒绝：$1" >&2; echo "" >&2; exit 1; }
+
+# ── 1. 路径级：这些文件永远不该入库 ─────────────────────────
+BLOCKED_PATHS='(^|/)config\.yml$|(^|/)data/|(^|/)backup/|\.db(-wal|-shm)?$|\.bundle$|(^|/)logs/|\.pem$|(^|/)id_rsa'
+hits=$(git diff --cached --name-only --diff-filter=ACMR | grep -E "$BLOCKED_PATHS" || true)
+if [ -n "$hits" ]; then
+    echo "$hits" | sed 's/^/    /' >&2
+    fail "上面这些文件属于配置/运行数据，不该进 git（config.yml 含密钥）"
+fi
+
+# ── 2. 内容级：扫描将要提交的内容 ───────────────────────────
+# 只扫暂存区（不扫工作区），跳过二进制
+added=$(git diff --cached --name-only --diff-filter=ACMR | while read -r f; do
+    [ -f "$f" ] || continue
+    head -c 8000 "$f" | grep -qP '\x00' 2>/dev/null || echo "$f"
+done)
+
+PATTERNS=(
+    'sk-[A-Za-z0-9]{20,}'                    # OCR / OpenAI 风格 API key
+    'app_secret[":= ]+["'"'"']?[A-Za-z0-9]{16,}'   # 飞书 app_secret
+    'tbl[A-Za-z0-9]{13,}'                    # 多维表格 table id
+    '(od-|ou_)[a-f0-9]{16,}'                 # 部门 / 用户 open id
+    '[a-z0-9]{10,12}\.feishu\.cn'            # 租户域名
+    '[A-Za-z0-9]{24,30}'                     # bitable app_token / wiki node token 形态
+)
+
+if [ -n "$added" ]; then
+    for pat in "${PATTERNS[@]}"; do
+        bad=$(echo "$added" | xargs -r grep -nE -- "$pat" 2>/dev/null \
+              | grep -v 'cli_9cb844403dbb9108'      `# 飞书官方公开的平台常量，允许` \
+              | grep -v 'cli_9c7cc8a9a9edd105' || true)
+        if [ -n "$bad" ]; then
+            echo "$bad" | head -8 | sed 's/^/    /' >&2
+            fail "检测到疑似密钥/租户标识符（模式: $pat）"
+        fi
+    done
+fi
+
+# 注意：本仓库里 cli_9cb844403dbb9108 是飞书审批小程序的**平台固定 appId**
+# （官方文档公开，所有租户相同），不是本项目的 app_id，故列入白名单。
+exit 0
