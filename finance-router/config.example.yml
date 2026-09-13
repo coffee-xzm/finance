@@ -1,0 +1,116 @@
+# 复制为 config.yml 后填入真实值。config.yml 不进 git。
+#
+# 当前阶段（只读侦察 / 并行期）只需要下面这一节：
+#   feishu.app_id / app_secret / approval_code
+# 其余留空即可 —— recon 工具不依赖多维表格与 OCR。
+
+server:
+  # ⚠ 本项目【不需要任何入站端口】：事件走【出站长连接】，API 调用也是出站。
+  #   这里只是为将来可能的本地健康检查留的占位，当前 recon/pdf2png 都是纯 CLI，不监听。
+  #   本机已占用：4000(0.0.0.0 tcp+udp)、4001(127.0.0.1)、3080、11434、7001、7897 等。
+  #   8080 当前空闲，但为避免与其它服务撞车，默认改用 18080。
+  listen: "127.0.0.1:18080"
+
+feishu:
+  app_id: ""
+  app_secret: ""
+  # ── 发现审批实例有两条路，配其中一条即可 ─────────────────
+  #
+  # 路径 A · 按定义枚举（推荐，能看到该审批的【全部】实例）
+  #   不需要保密：它只是标识"哪种审批"，会出现在浏览器 URL 和审批链接里。
+  #   在审批管理后台打开该定义，从 URL 取 ?approval_code=XXXX
+  approval_code: ""
+
+  # ★ 期望 approval_code 对应的审批叫什么（留空 = 不校验）。
+  #   填了之后 serve 启动会解析真实名称比对，对不上拒绝启动。
+  #   先跑 `go run ./cmd/approvals` 看清租户里有哪些表单。
+  approval_name_expect: ""
+
+  # 拼审批 applink 用的飞书审批小程序 appId。
+  # 留空 = 用内置平台默认值（该值所有租户相同，不是本项目的 app_id）。一般不用改。
+  approval_app_id: ""
+  #
+  # 路径 B · 按用户待办枚举（**不需要 approval_code**）
+  #   走 POST /approval/v4/tasks/search，只传 user_id 即可。
+  #   缺点：只覆盖"此人是审批人的任务"，不等于该定义的全量实例。
+  #   user_id 用 open_id（与 user_id_type 对应）。
+  user_id: ""
+  user_id_type: "open_id"         # open_id | union_id | user_id
+
+  base_url: "https://open.feishu.cn/open-apis"
+
+  # 低置信度通知的收件人（管理员）open_id。取值：给自己发条消息看 sender，
+  # 或从审批事件里的 operator_id 拿。留空则 doctor 跳过发消息检查。
+  admin_open_id: ""   # 收件人 open_id（★ 必须是【本应用】的 open_id，跨应用会报 99992361）
+  admin_user_id: ""   # 收件人 user_id（租户内一致，跨应用通用）；需 contact:user.employee_id:readonly
+  # ── 多维表格（测试用，放个人文件夹）─────────────────────
+  # 表结构清单：go run ./cmd/bitable-schema
+  # app_token：多维表格 URL 里 /base/ 后面那一段（整份文档共用一个，4 张表相同）
+  # table_id ：URL 里 ?table= 后面那段（tbl 开头），每张表一个
+  bitable:
+    app_token: ""
+    tables:
+      submission: ""          # 报销记录    ← 一行 = 一条审批实例
+      evidence: ""            # 识别证据    ← 一行 = 一张图
+      invoice_dedup: ""       # 发票唯一性  ← 本地唯一约束的镜像
+      pipeline_log: ""        # 处理日志    ← 事件幂等与状态机验证
+  subscribe:                      # 并行期【不要】订阅现有定义，保持物理隔离
+    # ⚠ 订阅接口需要 approval:approval 或 approval:definition 权限；
+    #   approval:approval:readonly 【不够】调 subscribe。
+    approval: false
+    bitable_record_changed: false
+
+# ── 以下为后续阶段用，侦察阶段留空即可 ──────────────────────────
+ocr:
+  provider: "siliconflow-qwen-vl"
+  base_url: "https://api.siliconflow.cn/v1"
+  api_key: ""
+  model: "Qwen/Qwen3-VL-32B-Instruct"   # 横评赢家；见 docs/30-review/12
+  response_format: "json_schema"
+  enable_thinking: false
+  temperature: 0.0
+  max_tokens: 3000              # 推理模型需给思维链留余量（非推理模型无副作用）
+  image_detail: "high"            # 默认；实际按图类型分层，见下方 detail_by_kind
+  max_edge_px: 1280               # 上传前压图：视觉 token ≈ ceil(h/28)*ceil(w/28)
+  jpeg_quality: 85
+  timeout_seconds: 60
+  concurrency: 3
+  retry:
+    max: 2
+    backoff_seconds: [2, 8]
+
+# ── PDF 去化（Qwen3-VL 不支持 PDF 输入，必须在本地光栅化）──────────
+pdf:
+  rasterizer: "pdftoppm"          # pdftoppm | pdftocairo | gs | convert
+  dpi: 300                        # ★ 150dpi 会漏读小字（实测）；300dpi 才读得准
+  max_pages: 5                    # 超过则只取前 N 页并告警（防多页票炸 token）
+  tmp_dir: "data/tmp"             # 中间产物目录，识别后即删（原图不长期落盘）
+
+# ── 按图类型分层，控制成本 ─────────────────────────────────────
+# detail=low 恒为 448x448 ≈ 256 token，比 high 便宜约 11 倍；
+# 但 448x448 下发票票号必糊，故发票必须 high。
+detail_by_kind:
+  invoice: "high"
+  order: "low"
+  payment: "low"
+
+# 人工审核策略
+review:
+  # 核对结果=一致 时是否自动通过（不打扰人）。
+  # true  → 只有出错的行才需人工：不通过才发私信
+  # false → 每行都要人确认（更保守，但费人力）
+  auto_pass_clean: true
+
+matching:
+  amount_tolerance_cent: 1
+  payment_after_order_days: 3
+  counterparty_threshold: 0.72
+
+notify:
+  cadence_days: [3, 7, 14, 30]
+  max_per_person_per_week: 2
+
+paths:
+  db: "data/finance.db"
+  backup_dir: "backup"
+  backup_keep: 14

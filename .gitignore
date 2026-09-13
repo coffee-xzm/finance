@@ -1,0 +1,43 @@
+# ── 真实配置（含 API key 与飞书密钥）────────────────────────
+# 唯一真实配置是 finance-router/config.yml，永不进 git。
+# finance-router/config.example.yml 进 git，是配置项的唯一文档来源。
+# 注意：不要写成裸 "config.yml" —— 那会连 .example 之外的同名文件一起匹配，
+#       也容易让人误以为根目录该有一份配置。
+finance-router/config.yml
+
+# ── 运行期数据（只存"证据与账"，不存票据原图）────────────────
+data/
+backup/
+*.db
+*.db-wal
+*.db-shm
+
+# ── 日志 ─────────────────────────────────────────────────
+logs/
+*.log
+
+# ── 临时/抓取产物 ─────────────────────────────────────────
+.scratch/
+.agent-feishu-cap/
+tmp/
+*.tmp
+
+# ── Go 构建产物 ────────────────────────────────────────────
+# bin/serve 是**唯一入库**的二进制：目标机（机器人）没装 Go，跑不了 go build，
+# 所以它随 git 一起发布。其余二进制（db/extract/sync/...）只是开发期工具，
+# 每编译一次就好几 MB，全塞进 git 会让仓库迅速膨胀（当前 8 个合计约 97MB）。
+finance-router/bin/*
+!finance-router/bin/serve
+
+# ── Go 构建产物与缓存（本机 ~/.cache 只读，故缓存放工作区内）────
+.gocache/
+.gomodcache/
+finance-router/data/
+finance-router/finance-router
+*.test
+
+# ── 编辑器与系统 ──────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
