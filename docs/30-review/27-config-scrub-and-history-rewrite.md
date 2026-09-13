@@ -118,6 +118,41 @@ $ ls finance-router/config.yml   → 不存在
 $ ls -d data                      → 不存在
 ```
 
+### 3.5 复验抓到的两轮残留（教训）
+
+「本地扫干净了」不等于「远程干净了」。用**全新克隆**复验，抓到两轮遗漏：
+
+**第一轮**：文档里把"泄露了什么"列成了表格，真实值又被写了一遍。
+更麻烦的是守卫**没拦住** —— 它的正则只覆盖了
+`tbl…` / `od-…` / `sk-…` / 租户域名这几种形态，而漏了：
+
+| 漏掉的形态 | 例子 |
+|---|---|
+| UUID | 审批实例号、审批定义 code |
+| 8 位短码 | 管理员 user id |
+| 15-25 位纯数字 | 发票号 |
+| 截断前缀 | `od-` 只留 8 位 |
+
+**第二轮**（补上规则后再验）：还有两类没清 ——
+
+| 漏掉的形态 | 例子 |
+|---|---|
+| 带 `widget` 前缀的控件 ID | 审批表单的 17 位控件 ID |
+| 长数字 ID | wiki space_id、长连接 conn_id、数字型实例 ID |
+| 另一个 app_token | 生产多维表格的 base token（与 config 里那个**不同一个**） |
+
+**结论：形态正则永远会漏。** 所以最终改成两层：
+
+1. **精确黑名单**（主力）—— 从 `config.yml` 生成 `.git/secret-blocklist`，
+   外加手工维护的 `.git/secret-extra`（放 config 之外的已知真实值）。
+   两者都在 `.git/` 下，永不入库。这样"没有独特前缀"的值也能精确拦住。
+2. **形态正则**（兜底）—— 覆盖 config 之外的**未来**真实数据（新实例号等）。
+
+顺带修掉一个反向问题：第一版守卫有一条 `[A-Za-z0-9]{24,30}`，
+本意是抓 app_token，但它会把 `go.sum` 校验和、Go 测试函数名、
+SDK 类型名（如 `P2InstanceStatusChangedV4`）统统拦下 —— **守卫太严会让人
+习惯性 `--no-verify`，等于没有守卫**。这条已删除，app_token 交给精确黑名单。
+
 ### 3.5 pre-commit 守卫
 
 事后清理不如事前拦住。`.githooks/pre-commit` 两层检查：
@@ -126,13 +161,15 @@ $ ls -d data                      → 不存在
 2. **内容级**：扫暂存内容里的 API key、`app_secret`、`table id`、部门/用户 open id、
    租户域名、app_token 形态。
 
-实测四种情况：
+实测：
 
 | 提交内容 | 结果 |
 |---|---|
 | 强行 `git add -f config.yml` | ✗ 拒绝 |
-| 含 `sk-abc…` 的假密钥 | ✗ 拒绝 |
+| 含假 API key | ✗ 拒绝 |
 | 含真实表 ID | ✗ 拒绝 |
+| UUID / 8 位 user_id / 发票号 / 截断部门 ID / app_token / wiki token | ✗ 全部拒绝 |
+| `go.sum` 校验和、Go 测试函数名、SDK 类型名 | ✓ 放行（不误伤） |
 | 正常改动 | ✓ 放行 |
 
 启用（每个 clone 一次）：`git config core.hooksPath .githooks`
