@@ -134,7 +134,7 @@ finance 那一条：
 pidfile   : data/serve.pid（PID 12018）
 正在建立长连接…（无需公网 IP；长连接不广播，故必须单实例）
   ✓ 已备份本地库 → backup/finance-20260913-200509.db
-[Info] connected to wss://msg-frontier.feishu.cn [conn_id=7684989715620072627]
+[Info] connected to wss://msg-frontier.feishu.cn [conn_id=<CONN_ID>]
 ```
 
 ### 3.2 单实例守卫有效

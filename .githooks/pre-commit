@@ -26,6 +26,7 @@ if [ -x "$ROOT/finance-router/scripts/gen-blocklist.sh" ]; then
     "$ROOT/finance-router/scripts/gen-blocklist.sh" >/dev/null 2>&1 || true
 fi
 BLOCKLIST="$GITDIR/secret-blocklist"
+EXTRA="$GITDIR/secret-extra"   # 手工维护：不在 config.yml 里的真实值（同样永不入库）
 
 # ── 1. 路径级：这些文件永远不该入库 ─────────────────────────
 BLOCKED_PATHS='(^|/)config\.yml$|(^|/)data/|(^|/)backup/|\.db(-wal|-shm)?$|\.bundle$|(^|/)logs/|\.pem$|(^|/)id_rsa|secret-blocklist'
@@ -48,14 +49,15 @@ report_and_fail() {
 }
 
 # ── 2a. 精确值（来自 config.yml）────────────────────────────
-if [ -f "$BLOCKLIST" ]; then
+for list in "$BLOCKLIST" "$EXTRA"; do
+    [ -f "$list" ] || continue
     while IFS= read -r val; do
         [ -n "$val" ] || continue
         bad=$(echo "$added" | xargs -r grep -Fn -- "$val" 2>/dev/null || true)
         [ -n "$bad" ] && report_and_fail "$bad" \
-            "命中 config.yml 里的真实值（$(echo "$val" | cut -c1-6)…）"
-    done < "$BLOCKLIST"
-fi
+            "命中真实值黑名单（$(echo "$val" | cut -c1-6)…）"
+    done < "$list"
+done
 
 # ── 2b. 形态（覆盖 config.yml 之外的真实数据：实例号、发票号…）──
 PATTERNS=(
@@ -64,7 +66,6 @@ PATTERNS=(
     'tbl[A-Za-z0-9]{13,}'                              # 多维表格 table id
     '(od-|ou_)[a-f0-9]{8,}'                            # 部门 / 用户 open id（含截断形式）
     '[a-z0-9]{10,12}\.feishu\.cn'                      # 租户域名
-    '[A-Za-z0-9]{24,30}'                               # app_token / wiki node token 形态
     '[A-Z0-9]{8}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{12}'  # 实例号 / 定义 code
     '[0-9]{15,25}'                                     # 发票号等长数字
 )
@@ -72,7 +73,8 @@ PATTERNS=(
 for pat in "${PATTERNS[@]}"; do
     bad=$(echo "$added" | xargs -r grep -nE -- "$pat" 2>/dev/null \
           | grep -v 'cli_9cb844403dbb9108' \
-          | grep -v 'cli_9c7cc8a9a9edd105' || true)
+          | grep -v 'cli_9c7cc8a9a9edd105' \
+          | grep -v 'feishu\.cn/content/article/' || true)   # 飞书公开帮助文章 URL
     [ -n "$bad" ] && report_and_fail "$bad" "检测到疑似真实标识符/数据（模式: $pat）"
 done
 

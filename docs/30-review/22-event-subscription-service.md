@@ -69,7 +69,7 @@ worker（★ 单实例、串行）
 ⚠ 订阅调用失败（若已在审批后台订阅过可忽略）: … scopes is required: [approval:approval, approval:definition]
 [Info] [event-dispatch is ready]
 正在建立长连接…
-[Info] connected to wss://msg-frontier.feishu.cn [conn_id=7684953050406571187]
+[Info] connected to wss://msg-frontier.feishu.cn [conn_id=<CONN_ID>]
 ```
 
 **长连接成功**，且**订阅失败时服务不退出**（降级正确）。

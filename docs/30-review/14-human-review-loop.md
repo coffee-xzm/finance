@@ -43,7 +43,7 @@
 ```
 https://<TENANT>.feishu.cn/wiki/<WIKI_NODE_TOKEN>
   ↓ 解析（GET /wiki/v2/spaces/get_node）
-space_id  = 7443744390131810323
+space_id  = <SPACE_ID>
 obj_type  = bitable
 obj_token = <BITABLE_APP_TOKEN>   ← 这就是 app_token
 现有内容   = 1 张表「数据表」、1 个字段（默认空表）

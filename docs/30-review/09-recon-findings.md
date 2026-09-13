@@ -44,27 +44,27 @@
 | 我们需要的语义 | 表单显示名 | 控件类型 | 控件 ID | 样例值 |
 |---|---|---|---|---|
 | **关联键** | — | — | `instance_code` | `9BF6F19C-...` |
-| 申请人 | 购买人 | `input` | `widget17285449833310001` | 胡天宇 |
-| **组别** | 物资所属部门 | `department` | `widget17301793988930001` | `[{"name":"机械组","open_id":"od-..."}]` |
-| 物资种类 | 物资种类 | `radioV2` | `widget16510509268920001` | 差旅费用 |
-| 物资名称 | 物资名称 | `textarea` | `widget16510509704570001` | 客运服务 |
-| 资金来源 | 资金来源 | `radioV2` | `widget17285447545480001` | 个人 |
-| 是否走大创资金 | 是否走大创资金报销 | `radioV2` | `widget17320041599990001` | 否 |
-| **金额（合计）** | 费用汇总 | **`formula`（只读！）** | `widget16510509818090001` | 228.31 |
-| **金额+日期（明细）** | 费用明细 | **`fieldList`** | `widget16510509950440001` | 见 §2.1 |
-| **发票** | 发票文件 | **`attachmentV2`** | `widget16510510447300001` | URL 数组 |
-| **订单** | 订单截图 | **`attachmentV2`** | `widget17285451116450001` | URL 数组 |
-| **付款** | 付款截图 | **`attachmentV2`** | `widget17302886803290001` | URL 数组 |
-| 备注 | 备注 | `textarea` | `widget17285451297220001` | 无 |
-| 说明 | 说明 1 | `text` | `widget17320046672070001` | 填表须知 |
+| 申请人 | 购买人 | `input` | `widget<WIDGET_ID>` | 胡天宇 |
+| **组别** | 物资所属部门 | `department` | `widget<WIDGET_ID>` | `[{"name":"机械组","open_id":"od-..."}]` |
+| 物资种类 | 物资种类 | `radioV2` | `widget<WIDGET_ID>` | 差旅费用 |
+| 物资名称 | 物资名称 | `textarea` | `widget<WIDGET_ID>` | 客运服务 |
+| 资金来源 | 资金来源 | `radioV2` | `widget<WIDGET_ID>` | 个人 |
+| 是否走大创资金 | 是否走大创资金报销 | `radioV2` | `widget<WIDGET_ID>` | 否 |
+| **金额（合计）** | 费用汇总 | **`formula`（只读！）** | `widget<WIDGET_ID>` | 228.31 |
+| **金额+日期（明细）** | 费用明细 | **`fieldList`** | `widget<WIDGET_ID>` | 见 §2.1 |
+| **发票** | 发票文件 | **`attachmentV2`** | `widget<WIDGET_ID>` | URL 数组 |
+| **订单** | 订单截图 | **`attachmentV2`** | `widget<WIDGET_ID>` | URL 数组 |
+| **付款** | 付款截图 | **`attachmentV2`** | `widget<WIDGET_ID>` | URL 数组 |
+| 备注 | 备注 | `textarea` | `widget<WIDGET_ID>` | 无 |
+| 说明 | 说明 1 | `text` | `widget<WIDGET_ID>` | 填表须知 |
 
 ### 2.1 `费用明细`（fieldList）的内部结构
 
 ```json
 [[
-  {"id":"widget16510510138590001","name":"日期（年-月-日）","type":"date",
+  {"id":"widget<WIDGET_ID>","name":"日期（年-月-日）","type":"date",
    "value":"2026-08-07T00:00:00+08:00","timezoneOffset":-480},
-  {"id":"widget16510510254730001","name":"金额","type":"amount",
+  {"id":"widget<WIDGET_ID>","name":"金额","type":"amount",
    "value":228.31,
    "ext":{"currency":"CNY","capitalValue":"贰佰贰拾捌元叁角壹分"}}
 ]]
@@ -91,7 +91,7 @@ https://internal-api-drive-stream.feishu.cn/space/api/box/stream/download/authco
 |---|---|
 | **没有 `file_token`** | → 走不通 `drive/v1/medias/:file_token/download`，那只适用于多维表格附件 |
 | **直链可直接 GET** | 实测 `HEAD` → **HTTP 200**，无额外鉴权头（authcode 自身即凭证） |
-| **有效期 24 小时** | authcode 解码为 `<hash>_<hash>_ID:7675647258982370483_1789281781:1789368181_V3`，起止相差 **86400 秒** |
+| **有效期 24 小时** | authcode 解码为 `<hash>_<hash>_ID:<FEISHU_ID>_1789281781:1789368181_V3`，起止相差 **86400 秒** |
 | **不是高级权限 `extra` 那条路** | 无需 `bitablePerm`；这是审批域的下载通道 |
 
 **因此：必须现读现用，不能缓存 URL。** 缓存了也要重取实例详情换新链接。

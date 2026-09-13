@@ -1,7 +1,7 @@
 # 设计反转：金额与日期一律从图读取 + 真实表格结构
 
 > 用户 2026-09-13 决定：**审批里的日期/金额不再使用，数据全部从图中读取**。
-> 并提供了真实多维表格：`https://<TENANT>.feishu.cn/base/Hoepb0Dl1ai4v8s97Rvc6DIynYc?table=<TABLE_PRODUCTION>&view=vewQM97eHa`
+> 并提供了真实多维表格：`https://<TENANT>.feishu.cn/base/<PRODUCTION_BASE_TOKEN>?table=<TABLE_PRODUCTION>&view=<VIEW_ID>`
 >
 > 本文记录：① 这次反转的含义；② 只读读到的真实表结构；③ 两个新发现；④ 对齐后的表设计。
 
@@ -43,7 +43,7 @@
 
 ## 1. 真实表结构（只读读取，`cmd/bitable-read`）
 
-`app_token = Hoepb0Dl1ai4v8s97Rvc6DIynYc`，共 **3 张表**：
+`app_token = <PRODUCTION_BASE_TOKEN>`，共 **3 张表**：
 
 | table_id | 名称 | 字段数 |
 |---|---|---|
@@ -109,14 +109,14 @@ https://www.feishu.cn/approval/admin/previewAttachment?key=<base64>
 表里的 `SourceID` 是 base64，解码后：
 
 ```
-7665354950683151343 : <APPROVAL_CODE_OTHER2> -1 : daba753ea822698121472f99d25c9c8f : 1
+<FEISHU_ID> : <APPROVAL_CODE_OTHER2> -1 : <FILE_HASH> : 1
        ↑ 表/租户标识          ↑★ 这就是 approval instance_code        ↑ 节点序号   ↑ hash
 ```
 
 **用途**：多维表格的一行 ←→ 审批实例的**反查通道**。
 在只读期若要拿"现有表某一行对应的审批实例"，靠它就能定位，不用猜。
 
-> ⚠️ 注意 `申请编号` 的 applink 里也有 `instanceId=7600309640437468348` —— 那是**数字 ID**，
+> ⚠️ 注意 `申请编号` 的 applink 里也有 `instanceId=<INSTANCE_NUMERIC_ID>` —— 那是**数字 ID**，
 > 与审批 API 的 `instance_code`（UUID 形式）**不是同一个东西**。**用 `SourceID` 那个**，不要用 applink 的数字。
 
 ---
