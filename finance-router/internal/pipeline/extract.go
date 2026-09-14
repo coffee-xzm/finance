@@ -43,6 +43,7 @@ import (
 	"time"
 
 	"github.com/coffee/finance-router/internal/config"
+	"github.com/coffee/finance-router/internal/exact"
 	"github.com/coffee/finance-router/internal/feishu"
 	"github.com/coffee/finance-router/internal/match"
 	"github.com/coffee/finance-router/internal/ocr"
@@ -85,6 +86,14 @@ type FileMeta struct {
 
 	// ProvErr 记录 provenance 旁路表写入失败（不阻断抽取，但会让 reindex 退化）。
 	ProvErr error `json:"-"`
+
+	// Exact 是"精确通道"的结果（PDF 文字层 + 票面二维码）。
+	// 非 nil 且 Sufficient() 时**不调模型** —— 这两条通道是确定性的，
+	// 既能省下 ≈5340 tok/张，又消除了识别误差。
+	// 两条通道都有时会交叉校验，冲突记在 ExactConflicts。
+	Exact          *exact.Fields    `json:"exact,omitempty"`
+	ExactConflicts []exact.Conflict `json:"exact_conflicts,omitempty"`
+	ExactUsed      bool             `json:"exact_used,omitempty"` // 是否真的没调模型
 }
 
 // InstanceMeta 是审批实例的业务元信息（来自审批表单，非图片识别）。
@@ -536,6 +545,11 @@ func downloadOne(ctx context.Context, url, slot, kind string, idx int, dir strin
 		for _, p := range pngs {
 			fm.EstTokens += estTokensFromPNG(p)
 		}
+		// ★ 精确通道①：PDF 文字层。
+		//   必须在删掉 PDF **之前**读 —— 默认 keepPDF=false，删了就没了。
+		if f, ferr := exact.FromPDF(pdfPath); ferr == nil && f != nil && f.InvoiceNo != "" {
+			fm.Exact = f
+		}
 		if !keepPDF {
 			os.Remove(pdfPath)
 		}
@@ -788,6 +802,35 @@ func extractInto(ctx context.Context, p ocr.Provider, fm *FileMeta, cfg *config.
 	if strings.HasSuffix(strings.ToLower(abs), ".jpg") || strings.HasSuffix(strings.ToLower(abs), ".jpeg") {
 		mt = "image/jpeg"
 	}
+	// ★ 精确通道②：二维码（从**已渲染的整页图**上解，不需要裁切定位）。
+	//   实测 2481×1654 的 300dpi 整页 PNG，gozxing 0.19 秒解出。
+	//
+	//   只对**发票**做：订单/付款截图里也可能出现二维码（支付页、小程序码…），
+	//   虽然 ParseQR 要求首段为 "01" 已经能挡掉大部分，但没必要冒这个险，
+	//   而且对它们做解码纯属浪费。
+	if fm.Kind == "invoice" {
+		if qf, qerr := exact.FromImageFile(abs); qerr == nil && qf != nil {
+			merged, conflicts := exact.Merge(fm.Exact, qf)
+			fm.Exact, fm.ExactConflicts = merged, conflicts
+			for _, c := range conflicts {
+				fmt.Printf("      ⚠ 精确通道冲突（%s）—— 两条通道读数不一致，交人工\n", c)
+			}
+		}
+	}
+
+	// ★ 精确通道够用 → **不调模型**。发票至少要拿到 发票号码 + 价税合计。
+	if fm.Exact != nil && fm.Exact.Sufficient() {
+		res := exactToResult(fm.Exact, fm.Kind)
+		fm.OCR = res
+		fm.ExactUsed = true
+		tol := cfg.Matching.AmountToleranceCent
+		fm.UpperChk = string(res.CheckUpper(tol))
+		fm.TaxChk = string(res.CheckTax(tol))
+		fmt.Printf("      ◎ 精确通道命中（%s）—— 未调用模型，省 ≈%d tok\n",
+			fm.Exact.Source, fm.EstTokens)
+		return
+	}
+
 	// detail 按图类型分层：发票 high，订单/付款 low（省钱且够用）
 	detail := cfg.DetailByKind[fm.Kind]
 	if detail == "" {
@@ -806,6 +849,27 @@ func extractInto(ctx context.Context, p ocr.Provider, fm *FileMeta, cfg *config.
 	tol := cfg.Matching.AmountToleranceCent
 	fm.UpperChk = string(res.CheckUpper(tol))
 	fm.TaxChk = string(res.CheckTax(tol))
+}
+
+// exactToResult 把精确通道的结果转成与模型输出同构的 ocr.Result，
+// 这样下游的校验（大写/税额）、匹配、入库全都不用改。
+func exactToResult(f *exact.Fields, kind string) *ocr.Result {
+	return &ocr.Result{
+		Kind:               ocr.Kind(kind),
+		Confidence:         1.0, // 确定性通道，不是"置信度"意义上的估计
+		AmountInclTaxCent:  f.AmountCent,
+		TaxCent:            f.TaxCent,
+		AmountExclTaxCent:  f.ExclCent,
+		AmountInclTaxUpper: f.AmountUpper,
+		Date:               f.Date,
+		Counterparty:       f.SellerName,
+		InvoiceCode:        f.InvoiceCode,
+		InvoiceNo:          f.InvoiceNo,
+		SellerTaxID:        f.SellerTaxID,
+		// 票面备注里的订单号 —— 这是"发票↔订单"最强的确定性键
+		OrderNo:  strings.Join(f.OrderNos, ","),
+		Provider: "exact:" + f.Source,
+	}
 }
 
 // amountBrief 把金额三件套压成一行显示。

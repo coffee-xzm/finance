@@ -70,8 +70,12 @@ PATTERNS=(
     '[0-9]{15,25}'                                     # 发票号等长数字
 )
 
+# 测试夹具天然需要长数字/示例 UUID（且必须用假值）。所以**形态**正则跳过 _test.go，
+# 但**精确黑名单**（上面的 2a）对所有文件生效 —— 真值放进测试一样会被拦。
+added_nontest=$(echo "$added" | grep -v '_test\.go$' || true)
+
 for pat in "${PATTERNS[@]}"; do
-    bad=$(echo "$added" | xargs -r grep -nE -- "$pat" 2>/dev/null \
+    bad=$(echo "$added_nontest" | xargs -r grep -nE -- "$pat" 2>/dev/null \
           | grep -v 'cli_9cb844403dbb9108' \
           | grep -v 'cli_9c7cc8a9a9edd105' \
           | grep -v 'feishu\.cn/content/article/' || true)   # 飞书公开帮助文章 URL
