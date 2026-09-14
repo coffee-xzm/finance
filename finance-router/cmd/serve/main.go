@@ -107,6 +107,15 @@ func main() {
 			"pidfile 路径（单实例守卫用；空字符串=关闭）")
 		forceStart = flag.Bool("force", false, "忽略 pidfile 里已有的实例，强制启动")
 		showVer    = flag.Bool("version", false, "打印版本后退出")
+		task       = flag.String("task", "",
+			"跑一次性运维任务后退出（机器人上没有 Go，只能靠这个二进制）：\n"+
+				"  refresh-meta  从审批单刷新表单元信息（归属组/是否支付宝/…）\n"+
+				"  regroup       用库里已有证据重算分组\n"+
+				"  sync          按「一张发票一行」落表\n"+
+				"  archive       把「通过」的行归档进整合表\n"+
+				"  notify        给「待审」的行发私信")
+		taskForce = flag.Bool("task-force", false, "配合 -task regroup：连已有分组一起重算")
+		taskDry   = flag.Bool("task-dry", false, "配合 -task：只打印，不写库/不写表")
 	)
 	flag.Parse()
 
@@ -122,6 +131,15 @@ func main() {
 			os.Exit(1)
 		}
 		*cfgPath = p
+	}
+	// 一次性运维任务：**在开库之前**分流，避免同时开两个连接。
+	// 机器人上没装 Go，这些运维动作只能由这个二进制自己提供。
+	if *task != "" {
+		if err := runTask(*task, *cfgPath, *taskForce, *taskDry); err != nil {
+			fmt.Fprintf(os.Stderr, "\n✗ %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
@@ -677,3 +695,25 @@ func prefixIf(cond bool, s string) string {
 
 // 保留 lark 包引用：后续加"消息卡片按钮"回调时用得到（卡片回调支持长连接）。
 var _ = lark.NewClient
+
+// runTask 跑一次性运维任务。
+//
+// 为什么放在 serve 里：机器人上**没有 Go**，只有这个编译好的二进制。
+// 没有这条路径，任何回填（分组规则改了、元信息列后加）都只能靠
+// "把库拷回来改完再拷回去"，既麻烦又容易出错。
+func runTask(task, cfgPath string, force, dry bool) error {
+	switch task {
+	case "refresh-meta":
+		return pipeline.RefreshMeta(cfgPath, dry)
+	case "regroup":
+		return pipeline.Regroup(cfgPath, force, dry)
+	case "sync":
+		return pipeline.RunSync(pipeline.SyncOptions{CfgPath: cfgPath, DryRun: dry, Update: true})
+	case "archive":
+		return pipeline.RunArchive(pipeline.ArchiveOptions{CfgPath: cfgPath, DryRun: dry})
+	case "notify":
+		return pipeline.RunNotify(pipeline.NotifyOptions{CfgPath: cfgPath, DryRun: dry, MaxSend: 5})
+	default:
+		return fmt.Errorf("未知任务 %q（可选：refresh-meta | regroup | sync | archive | notify）", task)
+	}
+}
