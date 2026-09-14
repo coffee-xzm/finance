@@ -127,10 +127,23 @@
 
 ---
 
-## 6. 待办
+## 6. 落地情况
 
-- [ ] 把文字层解析接进 `extract`（`pdftotext` 已在所有目标机上，含机器人）
-- [ ] 把二维码解码接进 `extract`（`gozxing` 已在 go.mod）
-- [ ] 建立"三路一致"校验：文字层 / 二维码 / 大写金额
-- [ ] 仅在精确通道缺失时才调用 VLM（省 token + 降误差）
-- [ ] 多张发票/订单/付款的**分组**（见后续文档）
+- [x] 文字层解析接进 `extract` → `internal/exact.ParseInvoiceText`
+      （`pdftotext` 已在所有目标机上，含机器人；在删 PDF **之前**读）
+- [x] 二维码解码接进 `extract` → `internal/exact.ParseQR` + `gozxing`
+      （整页 300dpi 渲染图直接解，无需裁切；只对发票做）
+- [x] 两通道交叉校验 → `exact.Merge` 返回**冲突列表**，不一致交人工
+- [x] 命中精确通道则不调模型 → `Fields.Sufficient()`（发票号码 + 价税合计）
+- [x] 顺带修 bug：税号的数字前缀被当成订单号（按子串排除，不是相等）
+- [ ] 多张发票/订单/付款的**分组**（见 docs/30-review/29）
+
+实测（真实测试实例）：
+
+```
+◎ 精确通道命中（pdftext+qr）—— 未调用模型，省 ≈5340 tok
+✓ 发票 上校验=OK 税校验=OK
+✓ 订单截图 与发票一致   ✓ 付款截图 与发票一致
+```
+
+测试：`internal/exact/exact_test.go`（6 个）
