@@ -1278,6 +1278,50 @@ func lastManifest(outDir, instanceCode string) (*Manifest, error) {
 //
 // 关键：整单在一个事务里写；任一条证据命中 sha256 唯一约束 → 整单回滚，
 // 并由调用方判定为"重复报销"。
+// storeGroups 把分组结果转成存储层结构。
+func storeGroups(g *match.Grouping) []store.DocGroup {
+	if g == nil {
+		return nil
+	}
+	out := make([]store.DocGroup, 0, len(g.Groups))
+	for i, grp := range g.Groups {
+		var orderSlots, paySlots []string
+		for _, o := range grp.Orders {
+			orderSlots = append(orderSlots, o.Slot)
+		}
+		for _, p := range grp.Payments {
+			paySlots = append(paySlots, p.Slot)
+		}
+		it, st := grp.InvoiceTotal, grp.SupportTotal
+		out = append(out, store.DocGroup{
+			GroupIndex:       i,
+			InvoiceNo:        grp.Invoice.InvoiceNo,
+			InvoiceSlot:      grp.Invoice.Slot,
+			OrderSlots:       orderSlots,
+			PaymentSlots:     paySlots,
+			InvoiceTotalCent: &it,
+			SupportTotalCent: &st,
+			Matched:          grp.Matched(1),
+			Reasons:          grp.Reasons,
+		})
+	}
+	return out
+}
+
+// invoiceNoSrcOf 标出这个发票号码是"精确通道读的"还是"模型读的"。
+//
+// 只有精确通道的号码才进唯一索引 —— 模型可能把号码读错一位，
+// 拿读错的号码做唯一约束，会把一个不存在的号锁死，反而挡住正确的那张票。
+func invoiceNoSrcOf(f FileMeta) string {
+	if f.Exact != nil && f.Exact.InvoiceNo != "" {
+		return "exact"
+	}
+	if f.OCR != nil && f.OCR.InvoiceNo != "" {
+		return "model"
+	}
+	return ""
+}
+
 func saveToDB(ctx context.Context, db *store.DB, m *Manifest) error {
 	sub := store.Submission{
 		InstanceCode: m.InstanceCode,
@@ -1317,6 +1361,12 @@ func saveToDB(ctx context.Context, db *store.DB, m *Manifest) error {
 			e.Provider = f.OCR.Provider
 			e.Model = f.OCR.Model
 			e.TraceID = f.OCR.TraceID
+			// 配对键与发票号码。InvoiceNoSrc 区分"精确通道读的"与"模型读的"——
+			// 唯一索引只对 exact 生效，避免把模型读错的号码锁死。
+			e.InvoiceNo = f.OCR.InvoiceNo
+			e.InvoiceNoSrc = invoiceNoSrcOf(f)
+			e.OrderNo = f.OCR.OrderNo
+			e.AlipayTxnID = f.OCR.AlipayTxnID
 			c := f.OCR.Confidence
 			e.Confidence = &c
 			// 发票作为主口径
@@ -1329,7 +1379,7 @@ func saveToDB(ctx context.Context, db *store.DB, m *Manifest) error {
 		}
 		evs = append(evs, e)
 	}
-	return db.SaveInstance(ctx, sub, evs)
+	return db.SaveInstanceWithGroups(ctx, sub, evs, storeGroups(m.Grouping))
 }
 
 // verdictText 把互核结论转成表里用的中文。

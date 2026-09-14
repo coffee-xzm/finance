@@ -157,6 +157,12 @@ type Evidence struct {
 	UpperCheck        string
 	TaxCheck          string
 	LocalPNG          string // 预处理图的本地路径（归档时要重新上传）
+
+	// ── 配对键与发票号码（见 migrations/0004）──
+	InvoiceNo    string
+	InvoiceNoSrc string // exact | model | ''
+	OrderNo      string
+	AlipayTxnID  string
 }
 
 // DupError 表示命中了 sha256 唯一约束 —— 即"这张图已经进过库"。
@@ -164,10 +170,14 @@ type Evidence struct {
 // 这是本系统**唯一一个靠数据库保证**的判定，不依赖任何上层检查或时序假设。
 type DupError struct {
 	SHA256       string
-	ExistingInst string // 首次占用该图的审批实例
+	ExistingInst string // 首次占用该图/票号的审批实例
+	Reason       string // 空=图片重复；"发票号码"=同一张发票的另一次拍照/导出
 }
 
 func (e *DupError) Error() string {
+	if e.Reason == "发票号码" {
+		return fmt.Sprintf("发票号码 %s 已报销过（首次来自实例 %s）", e.SHA256, e.ExistingInst)
+	}
 	return fmt.Sprintf("该图已存在（sha256=%s…，首次来自实例 %s）", short(e.SHA256), e.ExistingInst)
 }
 
@@ -176,6 +186,12 @@ func (e *DupError) Error() string {
 // 任一条证据命中 sha256 唯一约束 → 整个事务回滚并返回 *DupError。
 // 这样"部分写入"不会发生：要么这单完整入库，要么完全不入。
 func (d *DB) SaveInstance(ctx context.Context, s Submission, evs []Evidence) error {
+	return d.SaveInstanceWithGroups(ctx, s, evs, nil)
+}
+
+// SaveInstanceWithGroups 与 SaveInstance 相同，但**在同一个事务里**连分组一起写。
+// 分组与证据必须同生共死：只写了一半会让"一发票一行"的表出现无依据的行。
+func (d *DB) SaveInstanceWithGroups(ctx context.Context, s Submission, evs []Evidence, groups []DocGroup) error {
 	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -218,28 +234,46 @@ func (d *DB) SaveInstance(ctx context.Context, s Submission, evs []Evidence) err
 			INSERT INTO evidence (instance_code, slot, kind, index_no, filename, media_type,
 				sha256, size_bytes, amount_incl_tax_cent, tax_cent, amount_excl_tax_cent,
 				amount_upper, date, counterparty, provider, model, trace_id, confidence,
-				upper_check, tax_check, local_png, created_at)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				upper_check, tax_check, local_png, created_at,
+				invoice_no, invoice_no_src, order_no, alipay_txn_id)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			e.InstanceCode, e.Slot, e.Kind, e.IndexNo, e.Filename, e.MediaType,
 			e.SHA256, e.SizeBytes, e.AmountInclTaxCent, e.TaxCent, e.AmountExclTaxCent,
 			e.AmountUpper, nullIfEmpty(e.Date), e.Counterparty, e.Provider, e.Model,
-			e.TraceID, e.Confidence, e.UpperCheck, e.TaxCheck, e.LocalPNG, t)
+			e.TraceID, e.Confidence, e.UpperCheck, e.TaxCheck, e.LocalPNG, t,
+			e.InvoiceNo, e.InvoiceNoSrc, e.OrderNo, e.AlipayTxnID)
 		if err != nil {
 			if isUniqueViolation(err) {
-				// 查出是谁先占用的，便于人工判断
+				// 可能是 sha256 冲突（同一张图），也可能是**发票号码**冲突
+				// （同一张发票的另一次拍照/导出 —— 字节不同但票号相同）。
 				var owner string
 				_ = tx.QueryRowContext(ctx,
 					`SELECT instance_code FROM evidence WHERE sha256 = ?`, e.SHA256).Scan(&owner)
+				if owner == "" && e.InvoiceNo != "" {
+					_ = tx.QueryRowContext(ctx,
+						`SELECT instance_code FROM evidence WHERE invoice_no = ?`,
+						e.InvoiceNo).Scan(&owner)
+					return &DupError{
+						SHA256:       e.InvoiceNo,
+						ExistingInst: owner,
+						Reason:       "发票号码",
+					}
+				}
 				return &DupError{SHA256: e.SHA256, ExistingInst: owner}
 			}
 			return fmt.Errorf("写入 evidence(%s/%s): %w", e.Slot, short(e.SHA256), err)
+		}
+	}
+	if groups != nil {
+		if err := saveGroupsTx(ctx, tx, s.InstanceCode, groups); err != nil {
+			return err
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 	return d.audit(ctx, s.InstanceCode, "save_instance",
-		fmt.Sprintf("verdict=%s evidence=%d", s.Verdict, len(evs)))
+		fmt.Sprintf("verdict=%s evidence=%d groups=%d", s.Verdict, len(evs), len(groups)))
 }
 
 // DuplicateOf 只查不写：判断某个 sha256 是否已被占用，返回占用它的实例。
