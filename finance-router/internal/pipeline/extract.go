@@ -124,7 +124,11 @@ type Manifest struct {
 	Files        []FileMeta    `json:"files"`
 	Meta         *InstanceMeta `json:"meta,omitempty"`
 	At           string        `json:"at"`
-	Match        *match.Report `json:"match,omitempty"` // 三单互核结果
+	Match        *match.Report `json:"match,omitempty"` // 三单互核结果（旧：固定槽位，多张发票时只取第一张）
+
+	// Grouping 是新的"分组"结果：一张发票 + 它的订单 + 这些订单的付款。
+	// 需求定的是「一张发票一行」，以它为准；Match 保留仅为兼容下游，后续迁走。
+	Grouping *match.Grouping `json:"grouping,omitempty"`
 }
 
 // Options 是一次处理运行的参数。
@@ -397,6 +401,8 @@ func run(opts Options) error {
 			resolveDates(m.Files) // ★ 先用有年份的单据补全缺年份的（如电商订单页）
 			m.Match = runMatch(m.Files, cfg.Matching.AmountToleranceCent)
 			printMatch(m.Match)
+			m.Grouping = runGroup(m.Files, formOf(m.Meta.IsAlipay), cfg.Matching.AmountToleranceCent)
+			printGrouping(m.Grouping)
 		}
 
 		// ★ 入库：命中 sha256 唯一索引 → 判定为"重复报销"并拦截
@@ -964,6 +970,83 @@ func runMatch(files []FileMeta, tol int64) *match.Report {
 		})
 	}
 	return match.Compare(items, tol)
+}
+
+// formOf 把表单里「是否为支付宝付款」的值翻成形态枚举。
+// 只在明确等于"是"时算支付宝 —— 其它值（含空）一律按非支付宝处理，
+// 因为非支付宝的限制更严，宁可严一点也不要放宽。
+func formOf(isAlipay string) match.Form {
+	if strings.TrimSpace(isAlipay) == "是" {
+		return match.FormAlipay
+	}
+	return match.FormNonAlipay
+}
+
+// runGroup 把抽好的单据按规则分组。
+func runGroup(files []FileMeta, form match.Form, tol int64) *match.Grouping {
+	var docs []match.Doc
+	for _, f := range files {
+		if f.OCR == nil {
+			continue
+		}
+		kind := f.OCR.Kind
+		if kind == ocr.KindUnknown || kind == "" {
+			kind = ocr.Kind(f.Kind) // 回退到槽位推断
+		}
+		// ★ 配对键从**所有**可能带号的字段汇总，不假设哪个字段名才是对的。
+		//   实测模型在支付宝账单上会把交易号和商家订单号填反，
+		//   只有"汇总全部字段再求交集"才对这种填错免疫。
+		keys := match.KeysOf(f.OCR.OrderNo, f.OCR.AlipayTxnID, f.OCR.InvoiceNo)
+		docs = append(docs, match.Doc{
+			Slot:      f.Slot,
+			Kind:      kind,
+			Amount:    match.NormalizeAmount(f.OCR.AmountInclTaxCent, kind),
+			Date:      f.OCR.Date,
+			Party:     f.OCR.Counterparty,
+			InvoiceNo: f.OCR.InvoiceNo,
+			OrderNo:   f.OCR.OrderNo,
+			AlipayTxn: f.OCR.AlipayTxnID,
+			Keys:      keys,
+		})
+	}
+	return match.Build(docs, form, tol)
+}
+
+// printGrouping 打印分组结果。
+func printGrouping(g *match.Grouping) {
+	if g == nil {
+		return
+	}
+	if g.FormProblem != "" {
+		fmt.Printf("      ⛔ 提交形态不合规：%s\n", g.FormProblem)
+	}
+	fmt.Printf("      ── 分组：%d 组", len(g.Groups))
+	if len(g.Leftover) > 0 {
+		fmt.Printf("，另有 %d 份单据未配上（进纠错）", len(g.Leftover))
+	}
+	fmt.Println()
+	for i, grp := range g.Groups {
+		status := "✓ 金额对上"
+		if !grp.Matched(1) {
+			status = fmt.Sprintf("⚠ 发票 %s vs 支撑 %s 对不上",
+				match.Yuan(grp.InvoiceTotal), match.Yuan(grp.SupportTotal))
+		}
+		fmt.Printf("         [%d] 发票 %s | 订单 %d | 付款 %d  %s\n",
+			i+1, shortID(grp.Invoice.InvoiceNo), len(grp.Orders), len(grp.Payments), status)
+		for _, r := range grp.Reasons {
+			fmt.Printf("              · %s\n", r)
+		}
+	}
+	for _, d := range g.Leftover {
+		fmt.Printf("         ⚠ 未配上：%s（%s）\n", d.Slot, match.Yuan(derefCent(d.Amount)))
+	}
+}
+
+func derefCent(p *int64) int64 {
+	if p == nil {
+		return 0
+	}
+	return *p
 }
 
 // printMatch 打印互核结论。
