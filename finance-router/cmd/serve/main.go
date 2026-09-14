@@ -501,6 +501,24 @@ func (s *service) process(ctx context.Context, j job) {
 		return
 	}
 
+	// ★ 退回/拒绝/撤回类状态 → 把该单从本地库整体剔除。
+	//
+	// 需求：「被退回的就剔除掉」——原来那个多维表格只记录在审与通过的原数据。
+	//
+	// 这一步必须在"已处理过 → 跳过"**之前**：一单通常是先以"审批中"被处理入库，
+	// 之后才被驳回；若先撞上"已处理过"就直接 return，退回永远清不掉，
+	// 而且它占用的发票号码会一直锁着，队员改正后重交会被误判成重复报销。
+	if store.IsRejectedState(j.Status) {
+		if err := s.db.DeleteInstance(ctx, j.InstanceCode); err != nil {
+			fmt.Printf("  ✗ 剔除失败: %v\n", err)
+			s.failed.Add(1)
+			return
+		}
+		fmt.Printf("  ⊖ 实例 %s 状态为「%s」→ 已从本地库剔除（释放其占用的发票号码）\n",
+			short(j.InstanceCode), store.StateWord(j.Status))
+		return
+	}
+
 	// 已经处理过（本地库里有该实例）→ 不重复下载与识别
 	if exists, err := s.db.HasSubmission(ctx, j.InstanceCode); err == nil && exists {
 		fmt.Printf("  = 实例 %s 已处理过，跳过\n", short(j.InstanceCode))

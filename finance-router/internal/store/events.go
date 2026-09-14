@@ -123,6 +123,25 @@ var allowedTransitions = map[string][]string{
 	"已通过": {}, "已拒绝": {}, "已撤回": {}, "已撤销": {}, "已终止": {}, "已删除": {},
 }
 
+// rejectedStates 是"这单作废"的状态集合。
+//
+// 需求原话：「被退回的就剔除掉」「在报销核对表单可通过审批通过或退回选项…」。
+// 飞书侧对应的终态有多个（拒绝/撤回/撤销/终止/删除），它们都意味着
+// **这单不会报销了**，因此都该从「报销核对」里剔除，释放它占用的发票号码。
+//
+// ⚠️ 注意「退回」在飞书里通常表现为 REJECTED（审批人驳回）或 REVERTED（撤销），
+//
+//	两者都在这里。若将来飞书新增"退回给发起人"的独立状态，需要补进来 ——
+//	漏掉的后果是该单永远留在核对表里，占着发票号码。
+var rejectedStates = map[string]bool{
+	"已拒绝": true, "已撤回": true, "已撤销": true, "已终止": true, "已删除": true,
+}
+
+// IsRejectedState 判断原始状态（飞书枚举或中文）是否属于"该剔除"。
+func IsRejectedState(raw string) bool {
+	return rejectedStates[StateWord(raw)]
+}
+
 // TransitionResult 是一次状态跃迁的结果。
 type TransitionResult struct {
 	Applied bool // 是否真的发生了跃迁
