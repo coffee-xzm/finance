@@ -58,6 +58,45 @@ func (d *DB) ReplaceGroups(ctx context.Context, instanceCode string,
 		fmt.Sprintf("按已有证据重算分组：%d 组，%d 份未配上", len(groups), len(leftover)))
 }
 
+// PurgeAll 清空全部实例（分组 / 证据 / 提交）。
+//
+// 用途：测试数据整体作废，要干干净净重来。
+// 它同时释放所有 sha256 与发票号码 —— 否则测试数据占着这些键，
+// 真实发票再提交会被误判成"重复报销"。
+//
+// 审计记录**保留**（audit_log 是 append-only 的），可以追溯"曾经有过哪些单"。
+// 调用方有责任先备份，并把 data/extract/files 挪走（否则 -reindex 会把证据装回来）。
+func (d *DB) PurgeAll(ctx context.Context) (instances, evidence int, err error) {
+	err = d.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM submission`).Scan(&instances)
+	if err != nil {
+		return 0, 0, err
+	}
+	err = d.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM evidence`).Scan(&evidence)
+	if err != nil {
+		return 0, 0, err
+	}
+	tx, err := d.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		`DELETE FROM doc_group`,
+		`DELETE FROM evidence`,
+		`DELETE FROM submission`,
+	} {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return 0, 0, fmt.Errorf("清空失败(%s): %w", q, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	_ = d.audit(ctx, "*", "purge_all",
+		fmt.Sprintf("清空全部测试数据：%d 个实例 / %d 条证据（释放全部 sha256 与发票号码）", instances, evidence))
+	return instances, evidence, nil
+}
+
 // EvRef 拼出证据引用键（与 pipeline 侧的写法一致）。
 func EvRef(slot string, index int) string {
 	return slot + ":" + strconv.Itoa(index)

@@ -1273,6 +1273,43 @@ func (c *Client) GetDepartment(ctx context.Context, departmentID string) (*DeptI
 	return nil, firstErr
 }
 
+// GetUserName 用 open_id 换用户姓名。
+//
+// 为什么需要：审批表单里的 **contact 控件只给出用户 ID**（ou_…），
+// 不是人名。直接把它写进「购买人」列，等于对人说了一串乱码。
+// 需要权限 contact:user.base:readonly；拿不到时返回错误，
+// 调用方应当**不要**把 ID 当名字写下去。
+func (c *Client) GetUserName(ctx context.Context, openID string) (string, error) {
+	if openID == "" {
+		return "", fmt.Errorf("open_id 为空")
+	}
+	q := url.Values{}
+	q.Set("user_id_type", "open_id")
+	data, err := c.get(ctx, "/contact/v3/users/"+url.PathEscape(openID), q)
+	if err != nil {
+		return "", err
+	}
+	// 响应形态：data.user.name（外面可能还包一层）
+	var wrapper struct {
+		User struct {
+			Name string `json:"name"`
+		} `json:"user"`
+		Data struct {
+			Name string `json:"name"`
+		} `json:"data"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return "", fmt.Errorf("解析用户 %s: %w", openID, err)
+	}
+	for _, n := range []string{wrapper.User.Name, wrapper.Data.Name, wrapper.Name} {
+		if n != "" {
+			return n, nil
+		}
+	}
+	return "", fmt.Errorf("用户 %s 的响应里没有 name（缺 contact:user.base:readonly？）", openID)
+}
+
 // GetDepartmentName 是 GetDepartment 的便捷包装，只取名称。
 func (c *Client) GetDepartmentName(ctx context.Context, departmentID string) (string, error) {
 	info, err := c.GetDepartment(ctx, departmentID)

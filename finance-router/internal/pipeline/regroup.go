@@ -3,6 +3,8 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -245,6 +247,8 @@ func RefreshMeta(cfgPath string, dryRun bool) error {
 			continue
 		}
 		m := buildMeta(cfg, s.InstanceCode, detail, widgets)
+		// 购买人是 contact 控件：拿到的是用户 ID 时要换成姓名。
+		resolveBuyerName(ctx, client, m)
 		// 发起人部门：与 extract 同样的两步兜底（通讯录 → 本地对照表）。
 		// 都拿不到名字就**留空** —— 不要把 open_department_id / 部门 ID
 		// 写进「发起人部门」那一列，那是给人看的，一串哈希只会误导。
@@ -302,4 +306,129 @@ func RefreshMeta(cfgPath string, dryRun bool) error {
 	}
 	fmt.Printf("\n完成：刷新 %d 个，失败 %d 个\n", done, failed)
 	return nil
+}
+
+// PurgeAll 全清：本地库的实例 + 「报销核对」与「报销整合」里的全部行。
+//
+// 只用于"测试数据整体作废、干干净净重来"。它会**释放**所有 sha256 与发票号码 ——
+// 不清掉的话，测试单占着这些键，真实发票再提交会被误判成重复报销。
+//
+// 三件容易漏掉的事，这里都做了：
+//  1. 先备份本地库（VACUUM INTO），后悔了还能捞回来；
+//  2. 把 data/extract/files 挪走 —— 不挪的话下次 -reindex 会把证据全装回来；
+//  3. 表里的行也删 —— 本地清了表没清，人看到的就是一堆对不上号的孤儿行。
+func PurgeAll(cfgPath string, dryRun bool) error {
+	if cfgPath == "" {
+		p, err := config.FindConfigFile()
+		if err != nil {
+			return err
+		}
+		cfgPath = p
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return err
+	}
+	appToken := cfg.Feishu.Bitable.AppToken
+	if appToken == "" {
+		return fmt.Errorf("配置缺少 bitable.app_token")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	db, err := store.Open(cfg.Paths.DB)
+	if err != nil {
+		return fmt.Errorf("打开本地库失败: %w", err)
+	}
+	defer db.Close()
+
+	insts, err := db.SyncInstances(ctx, 0)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("本地库 %s：%d 个实例将被清空\n", cfg.Paths.DB, len(insts))
+	for _, in := range insts {
+		fmt.Printf("  - %s  %s  %s\n", short(in.Sub.InstanceCode),
+			in.Sub.ApprovalName, in.Sub.Applicant)
+	}
+
+	// 表里的行
+	client := feishu.NewClient(cfg.Feishu.BaseURL, cfg.Feishu.AppID, cfg.Feishu.AppSecret)
+	type tablePlan struct {
+		key, id  string
+		recordID []string
+	}
+	var plans []tablePlan
+	for _, key := range []string{"submission", "integrated"} {
+		id := cfg.Feishu.Bitable.Tables[key]
+		if id == "" {
+			continue
+		}
+		recs, err := client.SearchBitableRecords(ctx, appToken, id, nil, 500)
+		if err != nil {
+			return fmt.Errorf("读取表 %s(%s) 失败: %w", key, id, err)
+		}
+		p := tablePlan{key: key, id: id}
+		for _, r := range recs {
+			p.recordID = append(p.recordID, r.RecordID)
+		}
+		plans = append(plans, p)
+		fmt.Printf("表 %-10s %s：%d 行将被删除\n", key, id, len(p.recordID))
+	}
+	if dryRun {
+		fmt.Println("\n（dry-run：什么都没删）")
+		return nil
+	}
+
+	// ① 先备份
+	if path, err := db.Backup(ctx, cfg.Paths.BackupDir, cfg.Paths.BackupKeep); err != nil {
+		return fmt.Errorf("清空前备份失败，已中止（不敢在没有备份的情况下清库）: %w", err)
+	} else {
+		fmt.Printf("✓ 已备份本地库 → %s\n", path)
+	}
+	// ② 清本地库
+	n, ev, err := db.PurgeAll(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✓ 本地库已清空：%d 个实例 / %d 条证据\n", n, ev)
+	// ③ 挪走图片目录（否则 -reindex 会把证据装回来）
+	if moved, err := parkLocalFiles(cfg.Paths.BackupDir); err != nil {
+		fmt.Printf("⚠ 图片目录没挪走（下次 -reindex 会把证据装回来）: %v\n", err)
+	} else if moved != "" {
+		fmt.Printf("✓ 图片目录已挪到 %s（不会丢，只是不再被 reindex 扫到）\n", moved)
+	}
+	// ④ 删表里的行
+	for _, p := range plans {
+		gone := 0
+		for _, rid := range p.recordID {
+			if err := client.DeleteBitableRecord(ctx, appToken, p.id, rid); err != nil {
+				return fmt.Errorf("删除表 %s 的行 %s 失败: %w", p.key, rid, err)
+			}
+			gone++
+		}
+		fmt.Printf("✓ 表 %s：已删除 %d 行\n", p.key, gone)
+	}
+	return nil
+}
+
+// parkLocalFiles 把 data/extract/files 挪到备份目录下，返回新位置。
+//
+// 不直接删：图片是原始凭证，删了不可逆；挪走只是让 -reindex 扫不到。
+func parkLocalFiles(backupDir string) (string, error) {
+	src := filepath.Join("data", "extract", "files")
+	if _, err := os.Stat(src); err != nil {
+		return "", nil // 没有就不用管
+	}
+	if backupDir == "" {
+		backupDir = filepath.Join("data", "backup")
+	}
+	dst := filepath.Join(backupDir, "purged-"+time.Now().Format("20060102-150405"))
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.Rename(src, filepath.Join(dst, "files")); err != nil {
+		return "", err
+	}
+	return dst, nil
 }

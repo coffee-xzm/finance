@@ -52,8 +52,10 @@ var (
 		"机械外购件", "电控物资", "裁判系统相关", "视觉物资",
 	}
 	RealFundSources = []string{
-		"个人", "指导老师刘勇", "指导老师吴喆", "指导老师朱维勇",
-		"指导老师李小军", "指导老师陈球胜", "流动资金",
+		// ★ 必须以**当前审批表单**的选项为准：表单已简化成"个人 / 老师垫付"。
+		//   写一个表里没有的选项时飞书会**自动新建**，表里就会慢慢长出一堆
+		//   历史遗留选项；反过来，表里有表单已经没有的选项也不会有人用。
+		"个人", "老师垫付",
 	}
 	RealApprovalStatus = []string{
 		"审批中", "已通过", "已拒绝", "已取消", "已撤回", "已终止", "已删除",
@@ -78,26 +80,26 @@ type Table struct {
 	Fields      []Field
 }
 
-// slots 是三个附件槽位（与审批表单里的控件显示名对应）。
-var slots = []string{"发票文件", "订单截图", "付款截图"}
+// slots 是三个附件槽位的显示名。
+//
+// ★ 必须与**审批表单里的控件名**逐字一致：它们既决定落表时写哪个附件列，
+// 也是本地库里 evidence.slot / doc_group 的证据引用键。
+// 表单从「发票文件 / 付款截图」改名为「发票 / 付款记录」，这里跟着改。
+var slots = []string{"发票", "订单截图", "付款记录"}
 
-// ReviewTable 是**人工复核用**的表：一行一条审批实例，图片作为附件内联可看。
+// ReviewTable 是**人工复核用**的表：一行一张发票，图片作为附件内联可看。
+//
+// 字段取舍的唯一标准：**这一列对人核对有没有用**。
+// 只给人看结论、图片、以及能回答"这单是谁报的、报了多少钱"的字段。
+// 技术性的中间产物（配对键、分组序号、号码来源…）一律不进表。
 func ReviewTable() Table {
 	f := []Field{
 		{Name: "审批实例号", Type: TypeText, Note: "关联键，用来回查审批", SourceOfTruth: "feishu"},
 		// ★「发票号码」是"一张发票一行"的**幂等键**。
-		//   原来的幂等键只有「审批实例号」，那是"一行=一条审批"时代的产物 ——
-		//   一单多票时，同一实例的第二张票会覆盖第一张。
-		//   改用「审批实例号 + 发票号码」后，一张发票一行才成立。
-		//   首选精确通道（文字层/二维码）读出的号码；模型读的也写，但另有一列标注来源。
-		{Name: "发票号码", Type: TypeText, Note: "★ 幂等键之一；精确通道读出的才参与查重", SourceOfTruth: "image"},
-		{Name: "发票号码来源", Type: TypeSingleSelect, Options: []string{"exact", "model"},
-			Note: "exact=文字层/二维码确定性读出；model=识别读出（可能有误）", SourceOfTruth: "local"},
-		{Name: "分组序号", Type: TypeNumber, Formatter: "0",
-			Note: "同一审批实例内的分组序号，从 1 开始", SourceOfTruth: "local"},
-		{Name: "订单号", Type: TypeText, Note: "商家订单号（配对订单↔付款的键）", SourceOfTruth: "image"},
-		{Name: "支付宝交易号", Type: TypeText, Note: "辅助键；实测 28 位数字识别读不稳", SourceOfTruth: "image"},
-		{Name: "配对依据", Type: TypeText, Note: "人工复核时解释「凭什么配上的」", SourceOfTruth: "local"},
+		//   落表时要靠它判断"这一行写过了没有"，所以必须留在表里 ——
+		//   删掉它，同一张票每次同步都会被当成新行重复写入。
+		//   它同时也是人核对时最常拿来对照原图的字段。
+		{Name: "发票号码", Type: TypeText, Note: "★ 幂等键之一，勿删", SourceOfTruth: "image"},
 		{Name: "申请编号", Type: TypeURL, Note: "点开直达审批原单（溯源用；图片本身在附件列）", SourceOfTruth: "feishu"},
 		{Name: "申请状态", Type: TypeSingleSelect, Options: RealApprovalStatus, SourceOfTruth: "feishu"},
 		{Name: "发起时间", Type: TypeDate, DateFmt: "yyyy-MM-dd HH:mm", SourceOfTruth: "feishu"},
@@ -105,17 +107,10 @@ func ReviewTable() Table {
 		{Name: "发起人部门", Type: TypeText, SourceOfTruth: "feishu"},
 
 		{Name: "物资所属部门", Type: TypeMultiSelect, Options: RealDepartments, SourceOfTruth: "form"},
-		// 新表单的对应字段叫「归属组」，与旧表单的「物资所属部门」同义。
-		// 两个都保留：旧数据在旧列里，新数据写新列，避免把历史值搅乱。
-		{Name: "归属组", Type: TypeMultiSelect, Options: RealDepartments, SourceOfTruth: "form"},
 		{Name: "是否为支付宝付款", Type: TypeSingleSelect, Options: []string{"否", "是"}, SourceOfTruth: "form"},
 		{Name: "物资种类", Type: TypeSingleSelect, Options: RealMaterialTypes, SourceOfTruth: "form"},
-		{Name: "物资名称", Type: TypeText, SourceOfTruth: "form"},
 		{Name: "购买人", Type: TypeText, SourceOfTruth: "form"},
 		{Name: "资金来源", Type: TypeSingleSelect, Options: RealFundSources, SourceOfTruth: "form"},
-		{Name: "是否走大创资金报销", Type: TypeSingleSelect, Options: []string{"否", "是"}, SourceOfTruth: "form"},
-		{Name: "报销类型", Type: TypeSingleSelect, Options: []string{"大创", "教务经费"}, SourceOfTruth: "form"},
-		{Name: "备注", Type: TypeText, SourceOfTruth: "form"},
 
 		// ── 从图读出（供人核对）──
 		{Name: "图读金额(元)", Type: TypeNumber, Formatter: "0.00", Note: "发票价税合计（含税），单位：元", SourceOfTruth: "image"},
@@ -124,14 +119,16 @@ func ReviewTable() Table {
 		{Name: "销方名称", Type: TypeText, SourceOfTruth: "image"},
 
 		// ── 图片（附件：长期有效、可内联预览）──
-		{Name: "发票文件", Type: TypeAttachment, SourceOfTruth: "image"},
+		{Name: "发票", Type: TypeAttachment, SourceOfTruth: "image"},
 		{Name: "订单截图", Type: TypeAttachment, SourceOfTruth: "image"},
-		{Name: "付款截图", Type: TypeAttachment, SourceOfTruth: "image"},
+		{Name: "付款记录", Type: TypeAttachment, SourceOfTruth: "image"},
 
 		// ── 机器核对结论（人话，不含技术细节）──
 		{Name: "核对结果", Type: TypeSingleSelect,
 			Options: []string{"一致", "存疑", "缺件"}, SourceOfTruth: "local"},
-		{Name: "差异说明", Type: TypeText, Note: "如「发票 3.26 / 订单 3.26 / 付款 3.26」或差异原因", SourceOfTruth: "local"},
+		{Name: "差异说明", Type: TypeText,
+			Note:          "为什么这么判：金额对照 + 配对依据（原文来自 配对依据 列，已合并到这里）",
+			SourceOfTruth: "local"},
 
 		// ── 人工审核 ──
 		{Name: "人工审核", Type: TypeSingleSelect, Options: []string{"待审", "通过", "驳回"},
@@ -145,8 +142,8 @@ func ReviewTable() Table {
 		Key:       "review",
 		Name:      "报销核对",
 		Authority: "机器预填 + 人工确认",
-		Description: "一行 = 一条审批实例。图片在附件列可直接查看；" +
-			"技术性元信息（哈希/模型/置信度等）只保存在本地，不进表。",
+		Description: "一行 = 一张发票。图片在附件列可直接查看；" +
+			"配对键、分组序号、号码来源等技术性中间产物只保存在本地，不进表。",
 		Fields: f,
 	}
 }
@@ -155,11 +152,11 @@ func ReviewTable() Table {
 func IntegratedTable() Table {
 	src := ReviewTable()
 	keep := map[string]bool{
-		"审批实例号": true, "发票号码": true, "分组序号": true, "订单号": true,
-		"申请编号": true, "物资所属部门": true, "归属组": true, "物资种类": true,
-		"物资名称": true, "购买人": true, "资金来源": true,
+		"审批实例号": true, "发票号码": true,
+		"申请编号": true, "物资所属部门": true, "物资种类": true,
+		"购买人": true, "资金来源": true, "是否为支付宝付款": true,
 		"图读金额(元)": true, "图读税额(元)": true, "图读日期": true, "销方名称": true,
-		"发票文件": true, "订单截图": true, "付款截图": true,
+		"发票": true, "订单截图": true, "付款记录": true,
 		"审核备注": true,
 	}
 	var f []Field

@@ -380,28 +380,19 @@ func buildRowFields(ctx context.Context, c *feishu.Client, appToken string, r pl
 	setStr("发起人", r.Sub.Applicant)
 	setStr("发起人部门", r.Sub.ApplicantDept)
 	if len(r.Sub.Departments) > 0 {
-		f["归属组"] = r.Sub.Departments
+		f["物资所属部门"] = r.Sub.Departments
 	}
 	setStr("物资种类", r.Sub.MaterialType)
-	setStr("物资名称", r.Sub.MaterialName)
 	setStr("购买人", r.Sub.Buyer)
 	setStr("资金来源", r.Sub.FundSource)
-	setStr("是否走大创资金报销", r.Sub.Dachuang)
 	setStr("是否为支付宝付款", r.Sub.IsAlipay)
-	setStr("备注", r.Sub.Remark)
-	setStr("审批实例号", r.Sub.InstanceCode)
 
 	// ── 本行（一张发票）──
+	//
+	// 只写"对人有用"的：发票号码是幂等键 + 核对时的第一对照项，必须留。
+	// 配对键（订单号/支付宝交易号）、分组序号、号码来源都是中间产物 ——
+	// 它们要表达的意思已经合并进「差异说明」的一句话里，不再单列。
 	setStr("发票号码", r.InvoiceNo)
-	if len(r.InvoiceEvs) > 0 {
-		setStr("发票号码来源", r.InvoiceEvs[0].InvoiceNoSrc)
-	}
-	if r.GroupIdx > 0 {
-		f["分组序号"] = r.GroupIdx
-	}
-	setStr("订单号", joinDistinct(r.OrderEvs, func(e store.Evidence) string { return e.OrderNo }))
-	setStr("支付宝交易号", joinDistinct(r.OrderEvs, func(e store.Evidence) string { return e.AlipayTxnID }))
-	setStr("配对依据", strings.Join(groupReasons(r.Group), "；"))
 
 	// ── 图读结果（以本行发票为准）──
 	inv := firstEvidence(r.InvoiceEvs)
@@ -424,24 +415,24 @@ func buildRowFields(ctx context.Context, c *feishu.Client, appToken string, r pl
 	}
 
 	// ── 图片 → 附件字段（上传换 file_token）──
-	if err := attach(ctx, c, appToken, f, "发票文件", r.InvoiceEvs, dryRun); err != nil {
+	if err := attach(ctx, c, appToken, f, "发票", r.InvoiceEvs, dryRun); err != nil {
 		return nil, err
 	}
 	if err := attach(ctx, c, appToken, f, "订单截图", r.OrderEvs, dryRun); err != nil {
 		return nil, err
 	}
-	if err := attach(ctx, c, appToken, f, "付款截图", r.PaymentEvs, dryRun); err != nil {
+	if err := attach(ctx, c, appToken, f, "付款记录", r.PaymentEvs, dryRun); err != nil {
 		return nil, err
 	}
 	// 兜底行：把整实例的图都挂上（否则人工看不到任何图）。
 	if r.Group == nil {
-		if err := attach(ctx, c, appToken, f, "发票文件", inKind(r.AllEvs, "invoice"), dryRun); err != nil {
+		if err := attach(ctx, c, appToken, f, "发票", inKind(r.AllEvs, "invoice"), dryRun); err != nil {
 			return nil, err
 		}
 		if err := attach(ctx, c, appToken, f, "订单截图", inKind(r.AllEvs, "order"), dryRun); err != nil {
 			return nil, err
 		}
-		if err := attach(ctx, c, appToken, f, "付款截图", inKind(r.AllEvs, "payment"), dryRun); err != nil {
+		if err := attach(ctx, c, appToken, f, "付款记录", inKind(r.AllEvs, "payment"), dryRun); err != nil {
 			return nil, err
 		}
 	}
@@ -589,27 +580,6 @@ func firstEvidence(evs []store.Evidence) *store.Evidence {
 		return nil
 	}
 	return &evs[0]
-}
-
-func groupReasons(g *store.DocGroup) []string {
-	if g == nil {
-		return nil
-	}
-	return g.Reasons
-}
-
-func joinDistinct(evs []store.Evidence, get func(store.Evidence) string) string {
-	var out []string
-	seen := map[string]bool{}
-	for _, e := range evs {
-		v := strings.TrimSpace(get(e))
-		if v == "" || seen[v] {
-			continue
-		}
-		seen[v] = true
-		out = append(out, v)
-	}
-	return strings.Join(out, " / ")
 }
 
 // ────────────────────────── 小工具 ──────────────────────────

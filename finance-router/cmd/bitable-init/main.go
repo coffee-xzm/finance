@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -37,15 +38,20 @@ func main() {
 		newTable = flag.Bool("new", false, "新建一张表（而不是复用现有表）")
 		renames  = flag.String("rename", "",
 			"重命名字段，多个用逗号分隔，形如 旧名=新名,旧名2=新名2")
+		align = flag.Bool("align", false,
+			"把已存在字段的类型/选项对齐到 schema（选项变了、类型改了时用）")
+		prune = flag.Bool("prune", false,
+			"删除 schema 里没有的字段（表单删掉的项、历史遗留列）")
 	)
 	flag.Parse()
-	if err := run(*cfgPath, *appToken, *tableID, *integID, *dryRun, *newTable, *renames); err != nil {
+	if err := run(*cfgPath, *appToken, *tableID, *integID, *dryRun, *newTable, *renames, *align, *prune); err != nil {
 		fmt.Fprintf(os.Stderr, "\n✗ %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfgPath, appToken, tableID, integID string, dryRun, newTable bool, renames string) error {
+func run(cfgPath, appToken, tableID, integID string, dryRun, newTable bool, renames string,
+	align, prune bool) error {
 	if cfgPath == "" {
 		p, err := config.FindConfigFile()
 		if err != nil {
@@ -176,7 +182,10 @@ func run(cfgPath, appToken, tableID, integID string, dryRun, newTable bool, rena
 		fmt.Printf("  主字段: %q (id=%s) → 将改名为 %q\n", primary.FieldName, primary.FieldID, src.Fields[0].Name)
 	}
 	plan := planFields(src, existing)
+	fixes := planFixes(src, fields)
+	extras := planPrune(src, fields)
 	fmt.Printf("  需新增 %d 个字段（跳过已存在的）\n", len(plan))
+	printFixPlan(fixes, extras, align, prune)
 
 	fmt.Printf("\n整合表 %s\n", integ.Name)
 	if integID == "" {
@@ -214,6 +223,16 @@ func run(cfgPath, appToken, tableID, integID string, dryRun, newTable bool, rena
 		fmt.Printf("  ✓ %s (%s)\n", f.Name, typeName(f.Type))
 	}
 	fmt.Printf("源表：新增 %d 个字段\n", created)
+	if align {
+		if err := applyFixes(ctx, client, appToken, tableID, fixes, dryRun); err != nil {
+			return err
+		}
+	}
+	if prune {
+		if err := applyPrune(ctx, client, appToken, tableID, extras, dryRun); err != nil {
+			return err
+		}
+	}
 
 	if integID == "" {
 		newID, err := client.CreateBitableTable(ctx, appToken, integ.Name)
@@ -243,6 +262,17 @@ func run(cfgPath, appToken, tableID, integID string, dryRun, newTable bool, rena
 		fmt.Printf("  ✓ [整合] %s\n", f.Name)
 	}
 	fmt.Printf("整合表：新增 %d 个字段\n", createdInteg)
+	integAll, _ := client.ListBitableFields(ctx, appToken, integID)
+	if align {
+		if err := applyFixes(ctx, client, appToken, integID, planFixes(integ, integAll), dryRun); err != nil {
+			return err
+		}
+	}
+	if prune {
+		if err := applyPrune(ctx, client, appToken, integID, planPrune(integ, integAll), dryRun); err != nil {
+			return err
+		}
+	}
 
 	fmt.Printf("\n✓ 完成。请把下面两行填进 %s 的 feishu.bitable 段：\n", filepath.Base(cfgPath))
 	fmt.Printf("  app_token: %q\n", appToken)
@@ -310,4 +340,148 @@ func typeName(t bitable.FieldType) string {
 		return "附件"
 	}
 	return fmt.Sprintf("type=%d", int(t))
+}
+
+// ────────────────────────── 对齐与清理 ──────────────────────────
+
+// fieldFix 是"已有字段与 schema 不一致"的一条修正。
+type fieldFix struct {
+	FieldID string
+	Name    string
+	Why     string
+	Spec    feishu.FieldSpec
+}
+
+// planFixes 找出类型或选项与 schema 不一致的已有字段。
+//
+// 为什么需要：schema 改了（比如资金来源的选项从一串老师名简化成"个人/老师垫付"），
+// 光靠"新增缺失字段"是改不动的 —— 字段已存在就被跳过了，表里会一直留着旧选项。
+func planFixes(t bitable.Table, fields []feishu.BitableField) []fieldFix {
+	byName := map[string]feishu.BitableField{}
+	for _, e := range fields {
+		byName[e.FieldName] = e
+	}
+	var out []fieldFix
+	for _, f := range t.Fields {
+		e, ok := byName[f.Name]
+		if !ok || e.IsPrimary {
+			continue
+		}
+		if int(f.Type) != e.Type {
+			out = append(out, fieldFix{e.FieldID, f.Name,
+				fmt.Sprintf("类型 %d → %d", e.Type, int(f.Type)), toSpec(f)})
+			continue
+		}
+		if len(f.Options) == 0 {
+			continue
+		}
+		if !sameOptions(f.Options, existingOptions(e.Property)) {
+			out = append(out, fieldFix{e.FieldID, f.Name,
+				"选项 " + strings.Join(existingOptions(e.Property), "/") +
+					" → " + strings.Join(f.Options, "/"), toSpec(f)})
+		}
+	}
+	return out
+}
+
+// existingOptions 从字段属性里取出单/多选选项名。
+func existingOptions(prop json.RawMessage) []string {
+	if len(prop) == 0 {
+		return nil
+	}
+	var p struct {
+		Options []struct {
+			Name string `json:"name"`
+		} `json:"options"`
+	}
+	if json.Unmarshal(prop, &p) != nil {
+		return nil
+	}
+	var out []string
+	for _, o := range p.Options {
+		out = append(out, o.Name)
+	}
+	return out
+}
+
+// sameOptions 比较两组选项（顺序无关 —— 顺序只影响下拉框里的排列）。
+func sameOptions(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := map[string]bool{}
+	for _, x := range b {
+		set[x] = true
+	}
+	for _, x := range a {
+		if !set[x] {
+			return false
+		}
+	}
+	return true
+}
+
+// planPrune 找出表里有、但 schema 里没有的字段（跳过主字段）。
+func planPrune(t bitable.Table, fields []feishu.BitableField) []feishu.BitableField {
+	want := map[string]bool{}
+	for _, f := range t.Fields {
+		want[f.Name] = true
+	}
+	var out []feishu.BitableField
+	for _, e := range fields {
+		if e.IsPrimary || want[e.FieldName] {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func printFixPlan(fixes []fieldFix, extras []feishu.BitableField, align, prune bool) {
+	if align && len(fixes) > 0 {
+		fmt.Printf("  需对齐 %d 个已有字段：\n", len(fixes))
+		for _, f := range fixes {
+			fmt.Printf("    ~ %s（%s）\n", f.Name, f.Why)
+		}
+	}
+	if prune && len(extras) > 0 {
+		fmt.Printf("  需删除 %d 个 schema 里没有的字段：\n", len(extras))
+		for _, e := range extras {
+			fmt.Printf("    − %s\n", e.FieldName)
+		}
+	}
+	if !align && len(fixes) > 0 {
+		fmt.Printf("  ⚠ %d 个已有字段与 schema 不一致（加 -align 才会改）\n", len(fixes))
+	}
+	if !prune && len(extras) > 0 {
+		fmt.Printf("  ⚠ %d 个字段 schema 里没有（加 -prune 才会删）\n", len(extras))
+	}
+}
+
+func applyFixes(ctx context.Context, c *feishu.Client, appToken, tableID string,
+	fixes []fieldFix, dryRun bool) error {
+	for _, f := range fixes {
+		if dryRun {
+			continue
+		}
+		if err := c.UpdateBitableField(ctx, appToken, tableID, f.FieldID, f.Spec); err != nil {
+			return fmt.Errorf("对齐字段 %q 失败: %w", f.Name, err)
+		}
+		fmt.Printf("  ✓ [对齐] %s（%s）\n", f.Name, f.Why)
+	}
+	return nil
+}
+
+func applyPrune(ctx context.Context, c *feishu.Client, appToken, tableID string,
+	extras []feishu.BitableField, dryRun bool) error {
+	for _, e := range extras {
+		if dryRun {
+			continue
+		}
+		if err := c.DeleteBitableField(ctx, appToken, tableID, e.FieldID); err != nil {
+			return fmt.Errorf("删除字段 %q 失败: %w", e.FieldName, err)
+		}
+		fmt.Printf("  ✓ [删除] %s\n", e.FieldName)
+	}
+	return nil
 }

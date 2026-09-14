@@ -56,9 +56,9 @@ var slotRules = []struct {
 	Kind    string
 	Keyword []string
 }{
-	{"发票文件", "invoice", []string{"发票"}},
+	{"发票", "invoice", []string{"发票"}},
 	{"订单截图", "order", []string{"订单"}},
-	{"付款截图", "payment", []string{"付款", "转账", "支付"}},
+	{"付款记录", "payment", []string{"付款", "转账", "支付"}},
 }
 
 type FileMeta struct {
@@ -271,10 +271,13 @@ func run(opts Options) error {
 			fmt.Printf("      ✗ 解析表单失败: %v\n", err)
 			continue
 		}
+		meta := buildMeta(cfg, code, detail, widgets)
+		// 购买人是 contact 控件：拿到的是用户 ID 时要换成姓名。
+		resolveBuyerName(ctx, client, meta)
 		m := Manifest{
 			InstanceCode: code, Status: "OK",
 			At:   time.Now().Format(time.RFC3339),
-			Meta: buildMeta(cfg, code, detail, widgets),
+			Meta: meta,
 		}
 		// 每次解析表单都往对照表里累积「部门 open_id → 名称」，
 		// 供通讯录拿不到 name 时精确兜底。同时落库，跨次运行也能用。
@@ -1121,7 +1124,9 @@ func buildMeta(cfg *config.Config, code string, detail *feishu.InstanceDetail, w
 		case hasAny(w.Name, "物资名称"):
 			m.MaterialName = jsonRawToString(w.Value)
 		case hasAny(w.Name, "购买人"):
-			m.Buyer = jsonRawToString(w.Value)
+			// 「购买人」在新表单里是 **contact 控件**，值可能只是用户 ID 而不是人名。
+			// 调用方拿到 ID 后要再换一次姓名（resolveBuyerName）。
+			m.Buyer = personValue(w.Value)
 			m.Applicant = m.Buyer
 		case hasAny(w.Name, "资金来源"):
 			m.FundSource = jsonRawToString(w.Value)
@@ -1134,6 +1139,84 @@ func buildMeta(cfg *config.Config, code string, detail *feishu.InstanceDetail, w
 		}
 	}
 	return m
+}
+
+// personValue 从一个"人员"控件的值里取出人名或用户 ID。
+//
+// contact 控件的值形态实测可能有好几种（纯 ID、ID 数组、带 name 的对象数组），
+// 这里全都认；取不到 name 就退回收 ID —— **调用方负责把 ID 换成姓名**，
+// 换不到时应当留空，不要把 ID 写进给人看的列。
+func personValue(raw json.RawMessage) string {
+	if s := jsonRawToString(raw); s != "" {
+		return s
+	}
+	for _, seg := range jsonRawToMaps(raw) {
+		for _, k := range []string{"name", "text"} {
+			if v, ok := seg[k].(string); ok && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v)
+			}
+		}
+	}
+	for _, seg := range jsonRawToMaps(raw) {
+		for _, k := range []string{"open_id", "id", "user_id"} {
+			if v, ok := seg[k].(string); ok && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v)
+			}
+		}
+	}
+	// 纯字符串数组：["ou_xxx"]
+	var arr []string
+	if json.Unmarshal(raw, &arr) == nil && len(arr) > 0 {
+		return strings.TrimSpace(arr[0])
+	}
+	return ""
+}
+
+// looksLikeUserID 判断拿到的是不是"用户 ID 而不是人名"。
+// 人名几乎不会长这样；这样判断比"猜字段名"稳。
+func looksLikeUserID(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" || hasCJK(s) {
+		return false
+	}
+	if strings.HasPrefix(s, "ou_") || strings.HasPrefix(s, "on_") {
+		return true
+	}
+	// 长串无空格、无中文的标识符
+	if len(s) >= 18 && !strings.ContainsAny(s, " \t") {
+		return true
+	}
+	return false
+}
+
+// hasCJK 判断字符串里有没有汉字（人名几乎一定带汉字，ID 一定不带）。
+func hasCJK(s string) bool {
+	for _, r := range s {
+		if r >= 0x4e00 && r <= 0x9fff {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveBuyerName 把 contact 控件给的用户 ID 换成姓名。
+//
+// 换不到就**留空并告警**：把 ou_… 写进「购买人」列比空着更糟 ——
+// 人看到一串乱码会以为那就是填的内容。
+func resolveBuyerName(ctx context.Context, c *feishu.Client, m *InstanceMeta) {
+	if m == nil || !looksLikeUserID(m.Buyer) {
+		return
+	}
+	id := m.Buyer
+	if name, err := c.GetUserName(ctx, id); err == nil && name != "" {
+		m.Buyer, m.Applicant = name, name
+		return
+	}
+	fmt.Printf("      ⚠ 购买人只拿到用户 ID %s，姓名解析失败（缺 contact:user.base:readonly），留空\n", id)
+	m.Buyer = ""
+	if looksLikeUserID(m.Applicant) {
+		m.Applicant = ""
+	}
 }
 
 // hasAny 判断控件名是否包含任一关键字（新表单的控件名带括号说明）。

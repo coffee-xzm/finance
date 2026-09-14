@@ -102,9 +102,11 @@ func RunNotify(opts NotifyOptions) error {
 			c := int64(amtYuan*100 + 0.5)
 			amtCent = &c
 		}
+		// 私信标题用「发票号码 + 销方名称」——「物资名称」那一列已经不在表里了
+		//（新表单没有这个控件），用一张票的身份信息反而更好认。
 		n := notify.NeedManual{
 			InstanceCode: textOf(r.Fields["审批实例号"]),
-			Slot:         textOf(r.Fields["物资名称"]),
+			Slot:         joinNonEmpty(textOf(r.Fields["销方名称"]), textOf(r.Fields["发票号码"])),
 			Reason:       textOf(r.Fields["差异说明"]),
 			Verdict:      textOf(r.Fields["核对结果"]),
 			AmountCent:   amtCent,
@@ -217,4 +219,15 @@ type NotifyOptions struct {
 	CfgPath string
 	DryRun  bool
 	MaxSend int
+}
+
+// joinNonEmpty 用空格把非空片段连起来（私信标题用）。
+func joinNonEmpty(parts ...string) string {
+	var out []string
+	for _, p := range parts {
+		if strings.TrimSpace(p) != "" {
+			out = append(out, strings.TrimSpace(p))
+		}
+	}
+	return strings.Join(out, " ")
 }

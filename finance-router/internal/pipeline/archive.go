@@ -64,11 +64,9 @@ func writable(v json.RawMessage) any {
 
 // carryFields 是从源表复制到整合表的字段（其余留在源表作为过程痕迹）。
 var carryFields = []string{
-	"审批实例号", "申请编号", "物资所属部门", "物资种类", "物资名称",
-	"购买人", "资金来源", "图读金额(元)", "图读税额(元)", "图读日期",
-	"销方名称", "审核备注",
-	// 一张发票一行：整合表也要能看出"这是哪张票、属于哪一组"。
-	"发票号码", "分组序号", "订单号", "归属组",
+	"审批实例号", "发票号码", "申请编号",
+	"物资所属部门", "物资种类", "购买人", "资金来源", "是否为支付宝付款",
+	"图读金额(元)", "图读税额(元)", "图读日期", "销方名称", "审核备注",
 }
 
 func RunArchive(opts ArchiveOptions) error {
@@ -251,9 +249,9 @@ func uploadImages(ctx context.Context, c *feishu.Client, db *store.DB,
 
 // 文件名前缀 → 审批表单里的槽位名
 var slotByPrefix = map[string]string{
-	"invoice": "发票文件",
+	"invoice": "发票",
 	"order":   "订单截图",
-	"payment": "付款截图",
+	"payment": "付款记录",
 }
 
 // scanLocalImages 扫 data/extract/files/<实例号>/ 还原三张图。
@@ -355,7 +353,7 @@ func runRepair(ctx context.Context, c *feishu.Client, db *store.DB,
 			continue
 		}
 		has := 0
-		for _, k := range []string{"发票文件", "订单截图", "付款截图"} {
+		for _, k := range []string{"发票", "订单截图", "付款记录"} {
 			var arr []any
 			if json.Unmarshal(r.Fields[k], &arr) == nil {
 				has += len(arr)

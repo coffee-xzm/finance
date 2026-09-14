@@ -250,22 +250,22 @@ func slotFromFilename(name string) string {
 	b := strings.ToLower(name)
 	switch {
 	case strings.HasPrefix(b, "invoice"):
-		return "发票文件"
+		return "发票"
 	case strings.HasPrefix(b, "order"):
 		return "订单截图"
 	case strings.HasPrefix(b, "payment"):
-		return "付款截图"
+		return "付款记录"
 	}
 	return ""
 }
 
 func kindFromSlot(slot string) string {
 	switch slot {
-	case "发票文件":
+	case "发票":
 		return "invoice"
 	case "订单截图":
 		return "order"
-	case "付款截图":
+	case "付款记录":
 		return "payment"
 	}
 	return ""

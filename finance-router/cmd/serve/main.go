@@ -113,7 +113,8 @@ func main() {
 				"  regroup       用库里已有证据重算分组\n"+
 				"  sync          按「一张发票一行」落表\n"+
 				"  archive       把「通过」的行归档进整合表\n"+
-				"  notify        给「待审」的行发私信")
+				"  notify        给「待审」的行发私信\n"+
+				"  purge-all     ★危险★ 清空本地库 + 核对/整合表的全部行（先自动备份）")
 		taskForce = flag.Bool("task-force", false, "配合 -task regroup：连已有分组一起重算")
 		taskDry   = flag.Bool("task-dry", false, "配合 -task：只打印，不写库/不写表")
 	)
@@ -713,7 +714,9 @@ func runTask(task, cfgPath string, force, dry bool) error {
 		return pipeline.RunArchive(pipeline.ArchiveOptions{CfgPath: cfgPath, DryRun: dry})
 	case "notify":
 		return pipeline.RunNotify(pipeline.NotifyOptions{CfgPath: cfgPath, DryRun: dry, MaxSend: 5})
+	case "purge-all":
+		return pipeline.PurgeAll(cfgPath, dry)
 	default:
-		return fmt.Errorf("未知任务 %q（可选：refresh-meta | regroup | sync | archive | notify）", task)
+		return fmt.Errorf("未知任务 %q（可选：refresh-meta | regroup | sync | archive | notify | purge-all）", task)
 	}
 }
