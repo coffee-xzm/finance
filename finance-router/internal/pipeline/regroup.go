@@ -424,7 +424,10 @@ func parkLocalFiles(backupDir string) (string, error) {
 		backupDir = filepath.Join("data", "backup")
 	}
 	dst := filepath.Join(backupDir, "purged-"+time.Now().Format("20060102-150405"))
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	// ★ 必须建 dst **本身**，不是它的父目录：下面要把 src 重命名成 dst/files，
+	//   而 rename 不会自动创建目标路径的父目录 —— 只建 backup/ 是不够的，
+	//   会以 ENOENT 失败（实测踩过：库清空了、表也清空了，图片却还留在原地）。
+	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return "", err
 	}
 	if err := os.Rename(src, filepath.Join(dst, "files")); err != nil {
