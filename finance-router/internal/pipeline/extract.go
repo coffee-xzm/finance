@@ -101,7 +101,8 @@ type InstanceMeta struct {
 	ApplicantDept   string   `json:"applicant_dept"`    // 发起人部门名称
 	ApplicantDeptID string   `json:"applicant_dept_id"` // 发起人部门 open_department_id（od-…）
 	FundSource      string   `json:"fund_source"`
-	Dachuang        string   `json:"dachuang"` // 是否走大创资金报销
+	Dachuang        string   `json:"dachuang"`  // 是否走大创资金报销
+	IsAlipay        string   `json:"is_alipay"` // 是否为支付宝付款（新表单）
 	Remark          string   `json:"remark"`
 	// Applink 指向审批原单；instanceId 可直接用 instance_code（官方文档确认），
 	// 因此这条链接长期有效，适合放进多维表格给人点。
@@ -295,7 +296,7 @@ func run(opts Options) error {
 		dir := filepath.Join(outDir, "files", code)
 
 		for _, rule := range slotRules {
-			w, ok := findWidgetByName(widgets, rule.Keyword)
+			w, ok := findAttachmentWidget(widgets, rule.Keyword)
 			if !ok {
 				continue
 			}
@@ -435,6 +436,30 @@ func pickInstances(formsPath, one string, limit int) ([]string, error) {
 		return nil, fmt.Errorf("%s 里没有实例", formsPath)
 	}
 	return codes, nil
+}
+
+// findAttachmentWidget 找附件控件。
+//
+// ⚠️ 必须**同时按控件类型过滤**，不能只按名字匹配 —— 这是个真实踩过的坑：
+// 新表单的控件「是否为支付宝付款（上传多张发票：需满足一张发票对应一张订单，
+// 支付宝支付  |||  上传多张订单、付款记录：需满足支付宝支付）」名字里把
+// "发票"、"订单"、"付款" **全都包含**了，而且它排在真正的附件控件**前面**。
+// 只按名字匹配会让三个槽位全部命中这个 radio 控件，结果一张附件都取不到，
+// 而报错信息只说"槽位名对不上"，把人往完全错误的方向引。
+func findAttachmentWidget(ws []feishu.FormWidget, keywords []string) (feishu.FormWidget, bool) {
+	for _, w := range ws {
+		switch w.Type {
+		case "attachment", "attachmentV2", "image", "imageV2":
+		default:
+			continue
+		}
+		for _, k := range keywords {
+			if strings.Contains(w.Name, k) {
+				return w, true
+			}
+		}
+	}
+	return feishu.FormWidget{}, false
 }
 
 func findWidgetByName(ws []feishu.FormWidget, keywords []string) (feishu.FormWidget, bool) {
@@ -916,30 +941,55 @@ func buildMeta(cfg *config.Config, code string, detail *feishu.InstanceDetail, w
 				"&width=1136&height=750&path=pc%%2Fpages%%2Fin-process%%2Findex%%3FinstanceId%%3D%s",
 			resolveApprovalAppID(cfg), code),
 	}
+	// ★ 用"名称包含"匹配，不要用精确相等。
+	//
+	// 两张表单的控件名不一样，而且新表单的名字里带着长长的括号说明，例如
+	//   "归属组（技术组只能由技术组长选取，正式队员选择兵种组）"
+	//   "是否为支付宝付款（上传多张发票：需满足一张发票对应一张订单…）"
+	// 精确匹配会**静默落空** —— 字段就是空的，看不出哪里错。
 	for _, w := range widgets {
-		switch w.Name {
-		case "物资所属部门":
-			for _, seg := range jsonRawToMaps(w.Value) {
-				if n, ok := seg["name"].(string); ok && n != "" {
-					m.Departments = append(m.Departments, n)
-				}
-			}
-		case "物资种类":
+		switch {
+		case hasAny(w.Name, "物资所属部门", "归属组"):
+			m.Departments = append(m.Departments, deptNames(w.Value)...)
+		case hasAny(w.Name, "物资种类"):
 			m.MaterialType = jsonRawToString(w.Value)
-		case "物资名称":
+		case hasAny(w.Name, "物资名称"):
 			m.MaterialName = jsonRawToString(w.Value)
-		case "购买人":
+		case hasAny(w.Name, "购买人"):
 			m.Buyer = jsonRawToString(w.Value)
 			m.Applicant = m.Buyer
-		case "资金来源":
+		case hasAny(w.Name, "资金来源"):
 			m.FundSource = jsonRawToString(w.Value)
-		case "是否走大创资金报销":
+		case hasAny(w.Name, "是否走大创资金报销"):
 			m.Dachuang = jsonRawToString(w.Value)
-		case "备注":
+		case hasAny(w.Name, "是否为支付宝付款"):
+			m.IsAlipay = jsonRawToString(w.Value)
+		case hasAny(w.Name, "备注"):
 			m.Remark = jsonRawToString(w.Value)
 		}
 	}
 	return m
+}
+
+// hasAny 判断控件名是否包含任一关键字（新表单的控件名带括号说明）。
+func hasAny(name string, keys ...string) bool {
+	for _, k := range keys {
+		if strings.Contains(name, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// deptNames 取部门控件里的名称列表（值形如 [{"name":"…","open_id":"…"}]）。
+func deptNames(raw json.RawMessage) []string {
+	var out []string
+	for _, seg := range jsonRawToMaps(raw) {
+		if n, ok := seg["name"].(string); ok && n != "" {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 func jsonRawToMaps(raw json.RawMessage) []map[string]any {
