@@ -85,6 +85,19 @@ var slots = []string{"发票文件", "订单截图", "付款截图"}
 func ReviewTable() Table {
 	f := []Field{
 		{Name: "审批实例号", Type: TypeText, Note: "关联键，用来回查审批", SourceOfTruth: "feishu"},
+		// ★「发票号码」是"一张发票一行"的**幂等键**。
+		//   原来的幂等键只有「审批实例号」，那是"一行=一条审批"时代的产物 ——
+		//   一单多票时，同一实例的第二张票会覆盖第一张。
+		//   改用「审批实例号 + 发票号码」后，一张发票一行才成立。
+		//   首选精确通道（文字层/二维码）读出的号码；模型读的也写，但另有一列标注来源。
+		{Name: "发票号码", Type: TypeText, Note: "★ 幂等键之一；精确通道读出的才参与查重", SourceOfTruth: "image"},
+		{Name: "发票号码来源", Type: TypeSingleSelect, Options: []string{"exact", "model"},
+			Note: "exact=文字层/二维码确定性读出；model=识别读出（可能有误）", SourceOfTruth: "local"},
+		{Name: "分组序号", Type: TypeNumber, Formatter: "0",
+			Note: "同一审批实例内的分组序号，从 1 开始", SourceOfTruth: "local"},
+		{Name: "订单号", Type: TypeText, Note: "商家订单号（配对订单↔付款的键）", SourceOfTruth: "image"},
+		{Name: "支付宝交易号", Type: TypeText, Note: "辅助键；实测 28 位数字识别读不稳", SourceOfTruth: "image"},
+		{Name: "配对依据", Type: TypeText, Note: "人工复核时解释「凭什么配上的」", SourceOfTruth: "local"},
 		{Name: "申请编号", Type: TypeURL, Note: "点开直达审批原单（溯源用；图片本身在附件列）", SourceOfTruth: "feishu"},
 		{Name: "申请状态", Type: TypeSingleSelect, Options: RealApprovalStatus, SourceOfTruth: "feishu"},
 		{Name: "发起时间", Type: TypeDate, DateFmt: "yyyy-MM-dd HH:mm", SourceOfTruth: "feishu"},
@@ -92,6 +105,10 @@ func ReviewTable() Table {
 		{Name: "发起人部门", Type: TypeText, SourceOfTruth: "feishu"},
 
 		{Name: "物资所属部门", Type: TypeMultiSelect, Options: RealDepartments, SourceOfTruth: "form"},
+		// 新表单的对应字段叫「归属组」，与旧表单的「物资所属部门」同义。
+		// 两个都保留：旧数据在旧列里，新数据写新列，避免把历史值搅乱。
+		{Name: "归属组", Type: TypeMultiSelect, Options: RealDepartments, SourceOfTruth: "form"},
+		{Name: "是否为支付宝付款", Type: TypeSingleSelect, Options: []string{"否", "是"}, SourceOfTruth: "form"},
 		{Name: "物资种类", Type: TypeSingleSelect, Options: RealMaterialTypes, SourceOfTruth: "form"},
 		{Name: "物资名称", Type: TypeText, SourceOfTruth: "form"},
 		{Name: "购买人", Type: TypeText, SourceOfTruth: "form"},
