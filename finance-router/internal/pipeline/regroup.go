@@ -261,6 +261,12 @@ func RefreshMeta(cfgPath string, dryRun bool) error {
 			case info.Name != "":
 				m.ApplicantDept = info.Name
 				m.ApplicantDeptID = info.OpenDeptID
+				// 学到就记下来：同一个部门下一个实例未必还能查到名字
+				// （实测同一部门时有时无），缓存住才是稳的。
+				if info.OpenDeptID != "" {
+					_ = db.LearnDept(ctx, info.OpenDeptID, info.Name)
+					deptCache[info.OpenDeptID] = info.Name
+				}
 			default:
 				m.ApplicantDeptID = info.OpenDeptID
 				if name, ok := deptCache[info.OpenDeptID]; ok {
