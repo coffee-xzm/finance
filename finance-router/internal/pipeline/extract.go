@@ -116,6 +116,11 @@ type InstanceMeta struct {
 	// Applink 指向审批原单；instanceId 可直接用 instance_code（官方文档确认），
 	// 因此这条链接长期有效，适合放进多维表格给人点。
 	Applink string `json:"applink"`
+
+	// buyerIsID 表示 Buyer 里现在装的是**用户 ID**而不是姓名，需要换一次。
+	// 不导出、不入 JSON：它只在 buildMeta 与 resolveBuyerName 之间传一下，
+	// 两者紧挨着调用，不跨进程、不跨序列化。
+	buyerIsID bool
 }
 
 type Manifest struct {
@@ -1124,9 +1129,13 @@ func buildMeta(cfg *config.Config, code string, detail *feishu.InstanceDetail, w
 		case hasAny(w.Name, "物资名称"):
 			m.MaterialName = jsonRawToString(w.Value)
 		case hasAny(w.Name, "购买人"):
-			// 「购买人」在新表单里是 **contact 控件**，值可能只是用户 ID 而不是人名。
-			// 调用方拿到 ID 后要再换一次姓名（resolveBuyerName）。
+			// 「购买人」在新表单里是 **contact 控件**，值给的是用户 ID 而不是人名。
+			//
+			// ★ 用**控件类型**判断，不要靠"长得像不像 ID"猜：
+			//   实测 contact 的值是 ["u7x2k9qz"] —— 8 位、既不是 ou_ 开头、也不长，
+			//   任何"长度/前缀"启发式都会把它当成人名直接写进表。
 			m.Buyer = personValue(w.Value)
+			m.buyerIsID = w.Type == "contact"
 			m.Applicant = m.Buyer
 		case hasAny(w.Name, "资金来源"):
 			m.FundSource = jsonRawToString(w.Value)
@@ -1177,14 +1186,20 @@ func personValue(raw json.RawMessage) string {
 func looksLikeUserID(s string) bool {
 	s = strings.TrimSpace(s)
 	if s == "" || hasCJK(s) {
-		return false
+		return false // 有汉字 → 人名
 	}
 	if strings.HasPrefix(s, "ou_") || strings.HasPrefix(s, "on_") {
 		return true
 	}
-	// 长串无空格、无中文的标识符
-	if len(s) >= 18 && !strings.ContainsAny(s, " \t") {
-		return true
+	// 无空格、无汉字、且带数字的短标识符（实测 contact 给的就是 "u7x2k9qz" 这种）。
+	// 纯字母的拉丁人名（"John"）没有数字，不会被误判。
+	if strings.ContainsAny(s, " \t@.") {
+		return false
+	}
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			return true
+		}
 	}
 	return false
 }
@@ -1204,7 +1219,10 @@ func hasCJK(s string) bool {
 // 换不到就**留空并告警**：把 ou_… 写进「购买人」列比空着更糟 ——
 // 人看到一串乱码会以为那就是填的内容。
 func resolveBuyerName(ctx context.Context, c *feishu.Client, m *InstanceMeta) {
-	if m == nil || !looksLikeUserID(m.Buyer) {
+	if m == nil || m.Buyer == "" {
+		return
+	}
+	if !m.buyerIsID && !looksLikeUserID(m.Buyer) {
 		return
 	}
 	id := m.Buyer

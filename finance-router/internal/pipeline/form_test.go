@@ -130,15 +130,39 @@ func TestPersonValueShapes(t *testing.T) {
 }
 
 func TestLooksLikeUserID(t *testing.T) {
-	for _, s := range []string{"ou_abc123", "on_abc", "8f3a9c2b1d4e5f60718293a4b5"} {
+	for _, s := range []string{
+		"ou_abc123", "on_abc", "8f3a9c2b1d4e5f60718293a4b5",
+		// ★ 实测：contact 控件给的就是这种 8 位短 ID，没有 ou_ 前缀、也不长。
+		//   靠"长度/前缀"猜的实现会把它当人名直接写进「购买人」列。
+		"u7x2k9qz",
+	} {
 		if !looksLikeUserID(s) {
 			t.Errorf("%q 应被判定为用户 ID", s)
 		}
 	}
-	for _, s := range []string{"许芙蓉", "", "张三丰", "张三"} {
+	for _, s := range []string{"许芙蓉", "", "张三丰", "张三", "John", "Li Ming", "a@b.com"} {
 		if looksLikeUserID(s) {
-			t.Errorf("%q 不应被判定为用户 ID（这是人名）", s)
+			t.Errorf("%q 不应被判定为用户 ID（这是人名/邮箱）", s)
 		}
+	}
+}
+
+// contact 控件的值形态决定了必须靠**控件类型**判断，不能靠"长得像不像 ID"猜。
+func TestBuildMetaMarksContactBuyerAsID(t *testing.T) {
+	m := buildMeta(nil, "INST", &feishu.InstanceDetail{},
+		[]feishu.FormWidget{w("购买人", "contact", `["u7x2k9qz"]`)})
+	if m.Buyer != "u7x2k9qz" {
+		t.Fatalf("contact 值没解析出来: %q", m.Buyer)
+	}
+	if !m.buyerIsID {
+		t.Fatal("contact 控件的值必须标记为「这是 ID，要换姓名」")
+	}
+
+	// 旧表单的 input 控件：值是真人名，不该被当成 ID
+	m2 := buildMeta(nil, "INST", &feishu.InstanceDetail{},
+		[]feishu.FormWidget{w("购买人", "input", `"许芙蓉"`)})
+	if m2.buyerIsID {
+		t.Fatal("input 控件的人名被误判成 ID —— 会被白白清空")
 	}
 }
 

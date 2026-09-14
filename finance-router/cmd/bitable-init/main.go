@@ -344,6 +344,13 @@ func typeName(t bitable.FieldType) string {
 
 // ────────────────────────── 对齐与清理 ──────────────────────────
 
+// noAutoAlign 是不做**选项**对齐的字段（类型不一致仍然会对齐）。
+//
+// 「物资种类」的选项由使用方在审批表单里自己维护 —— 实测表单里被加过一个临时项，
+// 按 schema 强行覆盖会把它删掉，而下一次写入又会因为"选项不存在"自动建回来，
+// 净效果只是来回折腾。schema 里的选项列表只用于**首次建字段**。
+var noAutoAlign = map[string]bool{"物资种类": true}
+
 // fieldFix 是"已有字段与 schema 不一致"的一条修正。
 type fieldFix struct {
 	FieldID string
@@ -372,7 +379,7 @@ func planFixes(t bitable.Table, fields []feishu.BitableField) []fieldFix {
 				fmt.Sprintf("类型 %d → %d", e.Type, int(f.Type)), toSpec(f)})
 			continue
 		}
-		if len(f.Options) == 0 {
+		if len(f.Options) == 0 || noAutoAlign[f.Name] {
 			continue
 		}
 		if !sameOptions(f.Options, existingOptions(e.Property)) {

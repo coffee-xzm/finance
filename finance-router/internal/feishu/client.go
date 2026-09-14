@@ -1279,13 +1279,23 @@ func (c *Client) GetDepartment(ctx context.Context, departmentID string) (*DeptI
 // 不是人名。直接把它写进「购买人」列，等于对人说了一串乱码。
 // 需要权限 contact:user.base:readonly；拿不到时返回错误，
 // 调用方应当**不要**把 ID 当名字写下去。
-func (c *Client) GetUserName(ctx context.Context, openID string) (string, error) {
-	if openID == "" {
-		return "", fmt.Errorf("open_id 为空")
+func (c *Client) GetUserName(ctx context.Context, userID string) (string, error) {
+	if userID == "" {
+		return "", fmt.Errorf("用户 ID 为空")
+	}
+	// ★ 必须按**实际的 ID 类型**去查：审批 contact 控件实测给的是 user_id
+	//   （如 "u7x2k9qz"），不是 open_id。类型传错接口直接报 not found，
+	//   然后人就会以为是"没权限"，白折腾一圈。
+	idType := "user_id"
+	switch {
+	case strings.HasPrefix(userID, "ou_"):
+		idType = "open_id"
+	case strings.HasPrefix(userID, "on_"):
+		idType = "union_id"
 	}
 	q := url.Values{}
-	q.Set("user_id_type", "open_id")
-	data, err := c.get(ctx, "/contact/v3/users/"+url.PathEscape(openID), q)
+	q.Set("user_id_type", idType)
+	data, err := c.get(ctx, "/contact/v3/users/"+url.PathEscape(userID), q)
 	if err != nil {
 		return "", err
 	}
@@ -1300,14 +1310,14 @@ func (c *Client) GetUserName(ctx context.Context, openID string) (string, error)
 		Name string `json:"name"`
 	}
 	if err := json.Unmarshal(data, &wrapper); err != nil {
-		return "", fmt.Errorf("解析用户 %s: %w", openID, err)
+		return "", fmt.Errorf("解析用户 %s: %w", userID, err)
 	}
 	for _, n := range []string{wrapper.User.Name, wrapper.Data.Name, wrapper.Name} {
 		if n != "" {
 			return n, nil
 		}
 	}
-	return "", fmt.Errorf("用户 %s 的响应里没有 name（缺 contact:user.base:readonly？）", openID)
+	return "", fmt.Errorf("用户 %s 的响应里没有 name（缺 contact:user.base:readonly？）", userID)
 }
 
 // GetDepartmentName 是 GetDepartment 的便捷包装，只取名称。
