@@ -90,6 +90,7 @@ pdf:
 # detail=low 恒为 448x448 ≈ 256 token，比 high 便宜约 11 倍；
 # 但 448x448 下发票票号必糊，故发票必须 high。
 detail_by_kind:
+  # ★ 订单/付款也必须 high：low 时订单页的「支付宝交易号」读不出来（实测）。
   invoice: "high"
   order: "low"
   payment: "low"

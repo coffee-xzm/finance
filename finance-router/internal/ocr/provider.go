@@ -46,7 +46,8 @@ type Result struct {
 	InvoiceNo   string `json:"invoice_no"`
 	CheckCode   string `json:"check_code"`
 	SellerTaxID string `json:"seller_tax_id"`
-	OrderNo     string `json:"order_no"`
+	OrderNo     string `json:"order_no"`      // 商家/店铺订单号
+	AlipayTxnID string `json:"alipay_txn_id"` // 支付宝交易号（配对"订单↔付款"的键）
 
 	// 审计与可回放
 	Provider    string `json:"provider"`

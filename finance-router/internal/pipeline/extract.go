@@ -304,7 +304,18 @@ func run(opts Options) error {
 		}
 		dir := filepath.Join(outDir, "files", code)
 
+		// ★ 资金来源 = 老师垫付 时，**忽略付款记录**。
+		//
+		// 钱不是从报销人账户走的，付款截图既无意义也不一定拿得到。
+		// 注意表单里的选项文本是「老师垫付」（不是"代付"），用包含匹配避免
+		// 以后文案微调（如加标点）就静默失效。
+		skipPayment := strings.Contains(m.Meta.FundSource, "老师垫付")
+
 		for _, rule := range slotRules {
+			if rule.Kind == "payment" && skipPayment {
+				fmt.Printf("      · 资金来源=%s，跳过 %s\n", m.Meta.FundSource, rule.Slot)
+				continue
+			}
 			w, ok := findAttachmentWidget(widgets, rule.Keyword)
 			if !ok {
 				continue

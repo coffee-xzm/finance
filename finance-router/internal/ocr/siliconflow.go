@@ -111,8 +111,27 @@ const systemPrompt = `你是票据信息抽取器。只输出 JSON，不要解�
 - date: 单据上的日期，**原样抄写**，并遵守下面的「年份规则」
 - counterparty: 发票的销售方名称 / 订单的店铺名 / 转账的收款方
 - invoice_code/invoice_no/check_code/seller_tax_id: 仅发票有
-- order_no: 仅订单有
-- confidence: 你对本次识别的整体把握，0~1 的浮点数`
+- order_no: **商家/店铺的订单号**
+- alipay_txn_id: **支付宝交易号**
+- confidence: 你对本次识别的整体把握，0~1 的浮点数
+
+【★ 支付宝交易号 vs 订单号 —— 两个截图上的叫法不一样，极易搞混】
+
+这两个号都是 15~30 位纯数字。它们长得很像，但**是不同的东西**，
+用途也不同（交易号用于"订单↔付款"配对，订单号用于"发票↔订单"配对）。
+请严格按下面两张图各自的**标签**来填：
+
+1) **淘宝/天猫的订单详情页**（标题常是"交易成功"）：
+   - 标签写着「**支付宝交易号**」→ 填 alipay_txn_id
+   - 标签写着「**订单号**」      → 填 order_no
+
+2) **支付宝的账单详情页**（标题常是"账单详情"，有"支付时间/付款方式"）：
+   - 标签写着「**订单号**」      → 这其实是**支付宝交易号**，填 alipay_txn_id
+     ⚠️ 不要因为它叫"订单号"就填进 order_no —— 这是最容易错的一处。
+   - 标签写着「**商家订单号**」  → 填 order_no
+     若值带前缀（如 T200P 开头），**去掉前缀只保留后面的数字**。
+
+两者都看不到就填 null。**不要用金额或时间凑一个号出来。**`
 
 // jsonSchema 是结构化输出的契约。刻意保持扁平、只用受支持的构造。
 var jsonSchema = map[string]any{
@@ -137,12 +156,13 @@ var jsonSchema = map[string]any{
 			"check_code":            map[string]any{"type": []string{"string", "null"}},
 			"seller_tax_id":         map[string]any{"type": []string{"string", "null"}},
 			"order_no":              map[string]any{"type": []string{"string", "null"}},
+			"alipay_txn_id":         map[string]any{"type": []string{"string", "null"}},
 		},
 		"required": []string{
 			"kind", "confidence", "amount_incl_tax_cent", "tax_cent", "amount_excl_tax_cent",
 			"amount_incl_tax_upper",
 			"date", "counterparty", "invoice_code", "invoice_no", "check_code",
-			"seller_tax_id", "order_no",
+			"seller_tax_id", "order_no", "alipay_txn_id",
 		},
 		"additionalProperties": false,
 	},
@@ -163,6 +183,7 @@ type rawResult struct {
 	CheckCode          *string `json:"check_code"`
 	SellerTaxID        *string `json:"seller_tax_id"`
 	OrderNo            *string `json:"order_no"`
+	AlipayTxnID        *string `json:"alipay_txn_id"`
 }
 
 func (s *SiliconFlow) Extract(ctx context.Context, img ImageRef) (*Result, error) {
@@ -289,6 +310,7 @@ func (s *SiliconFlow) Extract(ctx context.Context, img ImageRef) (*Result, error
 	res.CheckCode = deref(rr.CheckCode)
 	res.SellerTaxID = deref(rr.SellerTaxID)
 	res.OrderNo = deref(rr.OrderNo)
+	res.AlipayTxnID = deref(rr.AlipayTxnID)
 	return res, nil
 }
 
