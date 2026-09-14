@@ -1091,10 +1091,16 @@ func resolveApprovalAppID(cfg *config.Config) string {
 // 因此这条链接**长期有效**，适合放进多维表格给人点。
 func buildMeta(cfg *config.Config, code string, detail *feishu.InstanceDetail, widgets []feishu.FormWidget) *InstanceMeta {
 	m := &InstanceMeta{
-		ApprovalName:  detail.ApprovalName,
-		Status:        detail.Status,
-		StartTime:     detail.StartTime,
-		ApplicantDept: detail.DepartmentID, // 先存 ID，稍后由调用方解析成名称
+		ApprovalName: detail.ApprovalName,
+		Status:       detail.Status,
+		StartTime:    detail.StartTime,
+		// ★ 发起人部门**不要**用 detail.DepartmentID 兜底。
+		//
+		// 那个值是 open_department_id / 自定义部门 ID（形如 od-… 或一串哈希），
+		// 放进「发起人部门」这一列对人毫无意义，还会让人以为"部门就叫这个"。
+		// 名字解析不出来就留空 —— 空是诚实的，乱码似的信息不是。
+		// ID 本身另行保留在 ApplicantDeptID 里备查。
+		ApplicantDeptID: detail.DepartmentID,
 		Applink: fmt.Sprintf(
 			"https://applink.feishu.cn/client/mini_program/open?mode=appCenter&appId=%s"+
 				"&width=1136&height=750&path=pc%%2Fpages%%2Fin-process%%2Findex%%3FinstanceId%%3D%s",

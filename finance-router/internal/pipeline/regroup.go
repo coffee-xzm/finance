@@ -245,17 +245,29 @@ func RefreshMeta(cfgPath string, dryRun bool) error {
 			continue
 		}
 		m := buildMeta(cfg, s.InstanceCode, detail, widgets)
-		// 发起人部门：与 extract 同样的两步兜底（通讯录 → 本地对照表）
+		// 发起人部门：与 extract 同样的两步兜底（通讯录 → 本地对照表）。
+		// 都拿不到名字就**留空** —— 不要把 open_department_id / 部门 ID
+		// 写进「发起人部门」那一列，那是给人看的，一串哈希只会误导。
 		if detail.DepartmentID != "" {
-			if info, derr := client.GetDepartment(ctx, detail.DepartmentID); derr == nil {
-				if info.Name != "" {
-					m.ApplicantDept = info.Name
-				} else if name, ok := deptCache[info.OpenDeptID]; ok {
+			info, derr := client.GetDepartment(ctx, detail.DepartmentID)
+			switch {
+			case derr != nil:
+				if name, ok := deptCache[detail.DepartmentID]; ok {
 					m.ApplicantDept = name
+				} else {
+					fmt.Printf("      ⚠ 部门 %s 名称未知（缺部门字段权限，对照表也没有），留空\n",
+						detail.DepartmentID)
 				}
+			case info.Name != "":
+				m.ApplicantDept = info.Name
 				m.ApplicantDeptID = info.OpenDeptID
-			} else if name, ok := deptCache[detail.DepartmentID]; ok {
-				m.ApplicantDept = name
+			default:
+				m.ApplicantDeptID = info.OpenDeptID
+				if name, ok := deptCache[info.OpenDeptID]; ok {
+					m.ApplicantDept = name
+				} else {
+					fmt.Printf("      ⚠ 部门 %s（%s）名称未知，留空\n", detail.DepartmentID, info.OpenDeptID)
+				}
 			}
 		}
 		fmt.Printf("  %s 归属组=%v 支付宝=%q 资金来源=%q 大创=%q 购买人=%q 发起人部门=%q\n",
