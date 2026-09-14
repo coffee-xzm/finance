@@ -18,6 +18,11 @@ type Doc struct {
 	OrderNo   string // 商家订单号 / 发票备注里的订单号
 	AlipayTxn string // 支付宝交易号（辅助）
 	Keys      KeySet // 长数字段集合 —— 配对主依据
+
+	// Ref 是调用方给的**回指**（本项目里是文件在 manifest 内的序号）。
+	// 分组本身不需要它；下游要把"这一组的图挂到哪一行"必须靠它 ——
+	// 一单多票时槽位名全都一样，光凭槽位无法区分。
+	Ref int
 }
 
 // Group 是分组结果：一张发票 + 它的订单 + 这些订单的付款。
@@ -35,10 +40,25 @@ type Group struct {
 	// InvoiceTotal / SupportTotal 是两侧金额（分）。相等才叫配上。
 	InvoiceTotal int64
 	SupportTotal int64
+
+	// InvoiceKnown / SupportKnown 表示**是否真的读到了金额**。
+	//
+	// 为什么不能只看两个数：读不到金额时两者都是 0，"0 == 0" 会被判成"对上"，
+	// 于是一单完全没读出金额的报销会被标成「一致」并自动通过。
+	// 在财务系统里这是最危险的一类错误 —— 没数据不等于没问题。
+	InvoiceKnown bool
+	SupportKnown bool
+
+	// Mismatch 表示组内的订单与付款**彼此**金额不一致。
+	// 这时哪怕"发票恰好等于其中一份"，也不能算对上 —— 有一份是错的。
+	Mismatch bool
 }
 
-// Matched 表示这个组的金额是否对得上。
+// Matched 表示这个组的金额是否对得上。金额缺失一律算"对不上"（交人工）。
 func (g Group) Matched(toleranceCent int64) bool {
+	if !g.InvoiceKnown || !g.SupportKnown || g.Mismatch {
+		return false
+	}
 	d := g.InvoiceTotal - g.SupportTotal
 	if d < 0 {
 		d = -d
@@ -102,6 +122,20 @@ func Build(docs []Doc, form Form, toleranceCent int64) *Grouping {
 		}
 	}
 
+	// ⓪ 需求明确定死的一条：**1 发票 + 1 订单 + 1 付款 直接绑定**。
+	//
+	// 用户原话："一张发票、一张订单、一张付款的这种直接绑定，如果金额对不上就交给人工。"
+	// 这是非支付宝的强制形态，也是支付宝里最常见的一票一单。
+	//
+	// 为什么不能只靠配对键：实测很多订单/付款截图根本读不到商家订单号
+	// （老表单、或识别失败），只靠键会让这些本该直接绑定的单全进人工。
+	// 一票一单时**不存在歧义**，唯一的组合就是正确答案。
+	if len(invoices) == 1 && len(orders) == 1 && len(payments) == 1 {
+		g.Groups = []Group{directBind(invoices[0], orders[0], payments[0], toleranceCent)}
+		g.FormProblem = checkForm(form, invoices, g.Groups)
+		return g
+	}
+
 	// ① 订单 ↔ 付款：共有长数字段
 	orderToPay := map[int][]Doc{}
 	usedPay := map[int]bool{}
@@ -123,6 +157,7 @@ func Build(docs []Doc, form Form, toleranceCent int64) *Grouping {
 		grp := Group{Invoice: inv}
 		if inv.Amount != nil {
 			grp.InvoiceTotal = *inv.Amount
+			grp.InvoiceKnown = true
 		}
 
 		// 2a. 先用发票备注里的订单号精确命中 —— 这比金额可靠得多
@@ -151,6 +186,7 @@ func Build(docs []Doc, form Form, toleranceCent int64) *Grouping {
 
 		// 2c. 挂上这些订单，以及已配到它们的付款
 		var total int64
+		supportKnown := false
 		for _, oi := range orderIdx {
 			grp.Orders = append(grp.Orders, orders[oi])
 			gotPay := false
@@ -158,15 +194,18 @@ func Build(docs []Doc, form Form, toleranceCent int64) *Grouping {
 				grp.Payments = append(grp.Payments, p)
 				if p.Amount != nil {
 					total += *p.Amount
+					supportKnown = true
 				}
 				gotPay = true
 			}
 			// 该订单没有配上付款时，用订单金额兜底（例如"老师垫付"根本没有付款记录）
 			if !gotPay && orders[oi].Amount != nil {
 				total += *orders[oi].Amount
+				supportKnown = true
 			}
 		}
 		grp.SupportTotal = total
+		grp.SupportKnown = supportKnown
 		g.Groups = append(g.Groups, grp)
 	}
 
@@ -183,6 +222,42 @@ func Build(docs []Doc, form Form, toleranceCent int64) *Grouping {
 	}
 
 	g.FormProblem = checkForm(form, invoices, g.Groups)
+	return g
+}
+
+// directBind 处理"1 发票 + 1 订单 + 1 付款"：直接绑成一组。
+//
+// 这个形态下**不存在歧义** —— 唯一的组合就是正确答案，所以不需要配对键。
+// 但仍然记录"是否读到了共同单号"，作为人工复核时的旁证。
+func directBind(inv, ord, pay Doc, tol int64) Group {
+	g := Group{Invoice: inv, Orders: []Doc{ord}, Payments: []Doc{pay}}
+	if inv.Amount != nil {
+		g.InvoiceTotal, g.InvoiceKnown = *inv.Amount, true
+	}
+	// 支撑金额优先取**订单**（那是货款本身）；没有订单金额才退回付款金额。
+	switch {
+	case ord.Amount != nil:
+		g.SupportTotal, g.SupportKnown = *ord.Amount, true
+	case pay.Amount != nil:
+		g.SupportTotal, g.SupportKnown = *pay.Amount, true
+	}
+	// 订单与付款都有金额时，它们必须一致 —— 否则有一份是错的，
+	// 不能因为"发票恰好等于其中一份"就放行。
+	if ord.Amount != nil && pay.Amount != nil {
+		if d := *ord.Amount - *pay.Amount; d > tol || d < -tol {
+			g.Mismatch = true
+		}
+	}
+	switch {
+	case inv.Keys.SharedKey(ord.Keys) != "":
+		g.Reasons = append(g.Reasons, fmt.Sprintf("发票与订单共有单号 %s（1 发票 1 订单 1 付款）",
+			inv.Keys.SharedKey(ord.Keys)))
+	case ord.Keys.SharedKey(pay.Keys) != "":
+		g.Reasons = append(g.Reasons, fmt.Sprintf("订单与付款共有单号 %s（1 发票 1 订单 1 付款）",
+			ord.Keys.SharedKey(pay.Keys)))
+	default:
+		g.Reasons = append(g.Reasons, "1 发票 1 订单 1 付款，按提交形态直接绑定（无需配对键）")
+	}
 	return g
 }
 

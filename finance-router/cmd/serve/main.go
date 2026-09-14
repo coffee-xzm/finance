@@ -514,6 +514,13 @@ func (s *service) process(ctx context.Context, j job) {
 			s.failed.Add(1)
 			return
 		}
+		// 本地库清了还不够：核对表里的行也得删，否则被退回的单会一直挂在
+		// 人工待办里，而且它占的那张发票看起来仍"在审"。
+		if n, err := pipeline.PurgeInstance(ctx, s.cfg, j.InstanceCode); err != nil {
+			fmt.Printf("  ⚠ 本地已剔除，但清理核对表失败（可稍后重跑）: %v\n", err)
+		} else if n > 0 {
+			fmt.Printf("  ⊖ 已从「报销核对」删除 %d 行\n", n)
+		}
 		fmt.Printf("  ⊖ 实例 %s 状态为「%s」→ 已从本地库剔除（释放其占用的发票号码）\n",
 			short(j.InstanceCode), store.StateWord(j.Status))
 		return
@@ -544,7 +551,7 @@ func (s *service) process(ctx context.Context, j job) {
 	// ② 落到多维表格
 	if err := pipeline.RunSync(pipeline.SyncOptions{
 		CfgPath: s.cfg.Path,
-		In:      "data/extract/manifest.jsonl",
+		Only:    j.InstanceCode,
 		Update:  true,
 	}); err != nil {
 		s.failed.Add(1)

@@ -1007,6 +1007,7 @@ func runGroup(files []FileMeta, form match.Form, tol int64) *match.Grouping {
 			OrderNo:   f.OCR.OrderNo,
 			AlipayTxn: f.OCR.AlipayTxnID,
 			Keys:      keys,
+			Ref:       f.Index,
 		})
 	}
 	return match.Build(docs, form, tol)
@@ -1286,21 +1287,36 @@ func storeGroups(g *match.Grouping) []store.DocGroup {
 	out := make([]store.DocGroup, 0, len(g.Groups))
 	for i, grp := range g.Groups {
 		var orderSlots, paySlots []string
+		var orderEvs, payEvs []string
 		for _, o := range grp.Orders {
 			orderSlots = append(orderSlots, o.Slot)
+			orderEvs = append(orderEvs, store.EvRef(o.Slot, o.Ref))
 		}
 		for _, p := range grp.Payments {
 			paySlots = append(paySlots, p.Slot)
+			payEvs = append(payEvs, store.EvRef(p.Slot, p.Ref))
 		}
 		it, st := grp.InvoiceTotal, grp.SupportTotal
+		// 金额没读到就别存 0 —— 0 会被下游当成"确实对上了"。
+		// 存 NULL，落表时判为"金额缺失，交人工"。
+		var itp, stp *int64
+		if grp.InvoiceKnown {
+			itp = &it
+		}
+		if grp.SupportKnown {
+			stp = &st
+		}
 		out = append(out, store.DocGroup{
 			GroupIndex:       i,
 			InvoiceNo:        grp.Invoice.InvoiceNo,
 			InvoiceSlot:      grp.Invoice.Slot,
 			OrderSlots:       orderSlots,
 			PaymentSlots:     paySlots,
-			InvoiceTotalCent: &it,
-			SupportTotalCent: &st,
+			InvoiceEv:        store.EvRef(grp.Invoice.Slot, grp.Invoice.Ref),
+			OrderEvs:         orderEvs,
+			PaymentEvs:       payEvs,
+			InvoiceTotalCent: itp,
+			SupportTotalCent: stp,
 			Matched:          grp.Matched(1),
 			Reasons:          grp.Reasons,
 		})
@@ -1338,6 +1354,27 @@ func saveToDB(ctx context.Context, db *store.DB, m *Manifest) error {
 		sub.Buyer = mt.Buyer
 		sub.FundSource = mt.FundSource
 		sub.Seller = "" // 下面从发票证据里取
+
+		// 表单元信息：同步「报销核对」需要它们才能填满一行
+		// （以前这些只存在 manifest.jsonl 里，而那个文件每次 extract 都被截断）。
+		sub.Applink = mt.Applink
+		sub.ApplicantDeptID = mt.ApplicantDeptID
+		sub.Departments = mt.Departments
+		sub.IsAlipay = mt.IsAlipay
+		sub.Dachuang = mt.Dachuang
+		sub.Remark = mt.Remark
+		if mt.StartTime != "" {
+			if ms, err := strconv.ParseInt(mt.StartTime, 10, 64); err == nil {
+				sub.StartTimeMS = &ms
+			}
+		}
+	}
+	// 形态不合规与"没配上的单据"也要留档：它们在表里是"待人工"的依据。
+	if g := m.Grouping; g != nil {
+		sub.FormProblem = g.FormProblem
+		for _, d := range g.Leftover {
+			sub.Leftover = append(sub.Leftover, store.EvRef(d.Slot, d.Ref))
+		}
 	}
 	var evs []store.Evidence
 	for _, f := range m.Files {
@@ -1350,6 +1387,7 @@ func saveToDB(ctx context.Context, db *store.DB, m *Manifest) error {
 		}
 		if len(f.PNGs) > 0 {
 			e.LocalPNG = f.PNGs[0] // 相对 data/extract
+			e.LocalPNGs = f.PNGs   // 全部页：多页 PDF 落表时不能只传第 1 页
 		}
 		if f.OCR != nil {
 			e.AmountInclTaxCent = f.OCR.AmountInclTaxCent

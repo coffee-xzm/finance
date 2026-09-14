@@ -12,6 +12,7 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -132,6 +133,19 @@ type Submission struct {
 	InvoiceDate   string
 	Seller        string
 	Verdict       string
+
+	// ── 表单元信息（见 migrations/0005）──
+	// 同步「报销核对」需要这些才能填满一行；以前靠 manifest.jsonl，但那个文件
+	// 每次 extract 都被截断，留不住历史。本地库才是权威来源。
+	Applink         string
+	StartTimeMS     *int64
+	ApplicantDeptID string
+	Departments     []string
+	IsAlipay        string
+	Dachuang        string
+	Remark          string
+	FormProblem     string
+	Leftover        []string // 没配上分组的单据（slot:index），落表时标为待人工
 }
 
 // Evidence 是一行证据（一张图）。
@@ -156,7 +170,8 @@ type Evidence struct {
 	Confidence        *float64
 	UpperCheck        string
 	TaxCheck          string
-	LocalPNG          string // 预处理图的本地路径（归档时要重新上传）
+	LocalPNG          string   // 预处理图的本地路径（归档时要重新上传）
+	LocalPNGs         []string // 全部页；多页 PDF 时 LocalPNG 只是第 1 页
 
 	// ── 配对键与发票号码（见 migrations/0004）──
 	InvoiceNo    string
@@ -199,12 +214,16 @@ func (d *DB) SaveInstanceWithGroups(ctx context.Context, s Submission, evs []Evi
 	defer tx.Rollback()
 
 	t := now()
+	deptsJSON := jsonList(s.Departments)
+	leftoverJSON := jsonList(s.Leftover)
 	// upsert 提交行：同实例重跑时更新业务字段，保留 first_seen_at
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO submission (instance_code, approval_code, approval_name, status,
 			applicant, applicant_dept, material_type, material_name, buyer, fund_source,
-			amount_cent, tax_cent, invoice_date, seller, verdict, first_seen_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			amount_cent, tax_cent, invoice_date, seller, verdict, first_seen_at, updated_at,
+			applink, start_time_ms, applicant_dept_id, departments_json, is_alipay,
+			dachuang, remark, form_problem, leftover_json)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(instance_code) DO UPDATE SET
 			status=excluded.status, applicant=excluded.applicant,
 			applicant_dept=excluded.applicant_dept,
@@ -212,10 +231,17 @@ func (d *DB) SaveInstanceWithGroups(ctx context.Context, s Submission, evs []Evi
 			buyer=excluded.buyer, fund_source=excluded.fund_source,
 			amount_cent=excluded.amount_cent, tax_cent=excluded.tax_cent,
 			invoice_date=excluded.invoice_date, seller=excluded.seller,
-			verdict=excluded.verdict, updated_at=excluded.updated_at`,
+			verdict=excluded.verdict, updated_at=excluded.updated_at,
+			applink=excluded.applink, start_time_ms=excluded.start_time_ms,
+			applicant_dept_id=excluded.applicant_dept_id,
+			departments_json=excluded.departments_json, is_alipay=excluded.is_alipay,
+			dachuang=excluded.dachuang, remark=excluded.remark,
+			form_problem=excluded.form_problem, leftover_json=excluded.leftover_json`,
 		s.InstanceCode, s.ApprovalCode, s.ApprovalName, s.Status,
 		s.Applicant, s.ApplicantDept, s.MaterialType, s.MaterialName, s.Buyer, s.FundSource,
-		s.AmountCent, s.TaxCent, s.InvoiceDate, s.Seller, s.Verdict, t, t); err != nil {
+		s.AmountCent, s.TaxCent, s.InvoiceDate, s.Seller, s.Verdict, t, t,
+		s.Applink, s.StartTimeMS, s.ApplicantDeptID, deptsJSON, s.IsAlipay,
+		s.Dachuang, s.Remark, s.FormProblem, leftoverJSON); err != nil {
 		return fmt.Errorf("写入 submission: %w", err)
 	}
 
@@ -235,13 +261,14 @@ func (d *DB) SaveInstanceWithGroups(ctx context.Context, s Submission, evs []Evi
 				sha256, size_bytes, amount_incl_tax_cent, tax_cent, amount_excl_tax_cent,
 				amount_upper, date, counterparty, provider, model, trace_id, confidence,
 				upper_check, tax_check, local_png, created_at,
-				invoice_no, invoice_no_src, order_no, alipay_txn_id)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				invoice_no, invoice_no_src, order_no, alipay_txn_id, local_pngs)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			e.InstanceCode, e.Slot, e.Kind, e.IndexNo, e.Filename, e.MediaType,
 			e.SHA256, e.SizeBytes, e.AmountInclTaxCent, e.TaxCent, e.AmountExclTaxCent,
 			e.AmountUpper, nullIfEmpty(e.Date), e.Counterparty, e.Provider, e.Model,
 			e.TraceID, e.Confidence, e.UpperCheck, e.TaxCheck, e.LocalPNG, t,
-			e.InvoiceNo, e.InvoiceNoSrc, e.OrderNo, e.AlipayTxnID)
+			e.InvoiceNo, e.InvoiceNoSrc, e.OrderNo, e.AlipayTxnID,
+			jsonList(e.LocalPNGs))
 		if err != nil {
 			if isUniqueViolation(err) {
 				// 可能是 sha256 冲突（同一张图），也可能是**发票号码**冲突
@@ -396,6 +423,31 @@ func nullIfEmpty(s string) any {
 		return nil
 	}
 	return s
+}
+
+// jsonList 把字符串切片存成 JSON；空切片存空串（而不是 "[]"），
+// 便于用 `column <> ”` 判断"有没有值"。
+func jsonList(v []string) string {
+	if len(v) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// parseList 是 jsonList 的逆操作，对空串与坏 JSON 都返回 nil。
+func parseList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	if json.Unmarshal([]byte(s), &out) != nil {
+		return nil
+	}
+	return out
 }
 
 func now() string { return time.Now().Format(time.RFC3339) }

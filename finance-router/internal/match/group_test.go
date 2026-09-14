@@ -143,22 +143,82 @@ func TestFormNonAlipayOneEachOK(t *testing.T) {
 	}
 }
 
-// 配不上的单据进 Leftover，交给人工纠错
-func TestUnmatchedGoesToLeftover(t *testing.T) {
+// ★ 1 发票 1 订单 1 付款 = 需求规定的"直接绑定"。
+// 即使读不到任何配对键，唯一的组合就是正确答案，必须成组。
+func TestDirectBindOneEachWithoutKeys(t *testing.T) {
 	docs := []Doc{
 		inv("发票", 4890, ""),
-		order("订单", 9999, gOrderNo), // 金额对不上、备注也没命中
-		pay("付款", 4890, "9999999999999999999"),
+		order("订单", 4890, ""),
+		pay("付款", 4890, ""),
+	}
+	g := Build(docs, FormAlipay, 1)
+	if len(g.Groups) != 1 {
+		t.Fatalf("1:1:1 应直接绑定成 1 组，实际 %d", len(g.Groups))
+	}
+	if len(g.Groups[0].Orders) != 1 || len(g.Groups[0].Payments) != 1 {
+		t.Fatalf("订单/付款都应挂上：orders=%d payments=%d",
+			len(g.Groups[0].Orders), len(g.Groups[0].Payments))
+	}
+	if len(g.Leftover) != 0 {
+		t.Errorf("1:1:1 不该有未配上的单据，实际 %d", len(g.Leftover))
+	}
+	if !g.Groups[0].Matched(1) {
+		t.Error("金额相等应判成配上")
+	}
+}
+
+// 1:1:1 但金额对不上 → 仍成一组（图都挂在一行，人看得到），但**不算配上**。
+func TestDirectBindMismatchIsNotMatched(t *testing.T) {
+	docs := []Doc{
+		inv("发票", 4890, ""),
+		order("订单", 9999, ""),
+		pay("付款", 4890, ""),
+	}
+	g := Build(docs, FormAlipay, 1)
+	if len(g.Groups) != 1 {
+		t.Fatalf("应成 1 组，实际 %d", len(g.Groups))
+	}
+	if g.Groups[0].Matched(1) {
+		t.Fatal("金额对不上不该判成配上")
+	}
+}
+
+// ★ 读不到金额时**绝不能**判成"对上"。
+//
+// 两个未知金额都是 0，"0 == 0" 会被误判成一致，进而自动通过 ——
+// 一单完全没读出金额的报销就这样悄悄过了。财务系统里这是最危险的错误。
+func TestUnknownAmountsNeverMatch(t *testing.T) {
+	docs := []Doc{
+		{Slot: "发票", Kind: ocr.KindInvoice},
+		{Slot: "订单", Kind: ocr.KindOrder},
+		{Slot: "付款", Kind: ocr.KindPayment},
+	}
+	g := Build(docs, FormAlipay, 1)
+	if len(g.Groups) != 1 {
+		t.Fatalf("应成 1 组，实际 %d", len(g.Groups))
+	}
+	if g.Groups[0].Matched(1) {
+		t.Fatal("金额未知被判成「对上」—— 无数据被当成了没问题")
+	}
+}
+
+// 多张订单里配不上的那些进 Leftover，交给人工纠错
+func TestUnmatchedGoesToLeftover(t *testing.T) {
+	docs := []Doc{
+		inv("发票", 4890, gOrderNo),
+		order("订单A", 4890, gOrderNo),
+		order("订单B", 9999, gOrderNo2), // 金额对不上、备注也没命中
+		pay("付款", 4890, gMerchant),
 	}
 	g := Build(docs, FormAlipay, 1)
 	if len(g.Groups) != 1 {
 		t.Fatalf("应仍有 1 组（发票本身），实际 %d", len(g.Groups))
 	}
-	if len(g.Groups[0].Orders) != 0 {
-		t.Fatalf("金额对不上的订单不该进组，实际 %d", len(g.Groups[0].Orders))
+	if len(g.Groups[0].Orders) != 1 {
+		t.Fatalf("只有命中的订单该进组，实际 %d", len(g.Groups[0].Orders))
 	}
-	if len(g.Leftover) != 2 {
-		t.Fatalf("订单与付款都应进 Leftover，实际 %d", len(g.Leftover))
+	if len(g.Leftover) != 1 {
+		t.Fatalf("配不上的订单应进 Leftover，实际 %d", len(g.Leftover))
 	}
 }
 

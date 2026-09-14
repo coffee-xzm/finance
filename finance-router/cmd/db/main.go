@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/coffee/finance-router/internal/config"
+	"github.com/coffee/finance-router/internal/pipeline"
 	"github.com/coffee/finance-router/internal/store"
 )
 
@@ -32,7 +33,14 @@ func main() {
 		listBak = flag.Bool("backup-list", false, "列出已有备份")
 		reindex = flag.Bool("reindex", false,
 			"从 data/extract/files 重建唯一性状态（库被删/重建后恢复保护）")
-		dups = flag.Bool("dups", false, "列出重复报销嫌疑（同一张图出现在多个实例）")
+		dups    = flag.Bool("dups", false, "列出重复报销嫌疑（同一张图出现在多个实例）")
+		regroup = flag.Bool("regroup", false,
+			"用库里已有的证据重算分组（分组规则改过、或早期实例没有分组记录时用）")
+		regroupAll = flag.Bool("regroup-all", false,
+			"重算**全部**实例的分组（默认只补没有分组的）")
+		regroupDry = flag.Bool("regroup-dry", false, "配合 -regroup：只打印，不写库")
+		refresh    = flag.Bool("refresh-meta", false,
+			"从审批单刷新表单元信息（归属组/是否支付宝/资金来源…），不动证据与分组")
 	)
 	flag.Parse()
 
@@ -43,6 +51,21 @@ func main() {
 			os.Exit(1)
 		}
 		*cfgPath = p
+	}
+	if *regroup {
+		// 单独处理：Regroup 自己开库，这里不要重复打开。
+		if err := pipeline.Regroup(*cfgPath, *regroupAll, *regroupDry); err != nil {
+			fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *refresh {
+		if err := pipeline.RefreshMeta(*cfgPath, *regroupDry); err != nil {
+			fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {

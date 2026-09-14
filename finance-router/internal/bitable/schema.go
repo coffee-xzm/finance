@@ -155,7 +155,8 @@ func ReviewTable() Table {
 func IntegratedTable() Table {
 	src := ReviewTable()
 	keep := map[string]bool{
-		"审批实例号": true, "申请编号": true, "物资所属部门": true, "物资种类": true,
+		"审批实例号": true, "发票号码": true, "分组序号": true, "订单号": true,
+		"申请编号": true, "物资所属部门": true, "归属组": true, "物资种类": true,
 		"物资名称": true, "购买人": true, "资金来源": true,
 		"图读金额(元)": true, "图读税额(元)": true, "图读日期": true, "销方名称": true,
 		"发票文件": true, "订单截图": true, "付款截图": true,
