@@ -15,6 +15,9 @@ package config
 const (
 	RoleInvoiceCollect = "invoice_collect"
 	RolePurchase       = "purchase"
+	// RoleLedgerRegister 是「27-流水登记」：采购通过后先给财务登记人开这张单，
+	// 由他核对/补全（转入/支出、金额、转账日期、截图、来源/去向），通过后再开票。
+	RoleLedgerRegister = "ledger_register"
 )
 
 // 多维表格 base 名字。
@@ -135,7 +138,9 @@ func DefaultDict() Dict {
 			},
 			// 27 - 收支表
 			"ledger": {
-				"record_id":        "记录ID",
+				// ★ 主字段（原 AutoNumber「记录ID」，2026-09-21 用户改成 Url 类型并改名
+				//   「流水审批ID」）→ 指向「27-流水登记」实例，是本服务写流水的幂等锚点。
+				"flow_id":          "流水审批ID",
 				"invoice_task":     "🔗 关联发票任务",
 				"subject":          "🔗 科目 / 去向",
 				"direction":        "收支方向（支出/收入）",
@@ -146,6 +151,8 @@ func DefaultDict() Dict {
 				"apply_link":       "🔗 关联申请单ID",
 				"note":             "🔗 备注",
 				"related_user":     "关联人",
+				"amount_source":    "金额来源", // 2026-09-21 新增：对齐「27-流水登记」的「金额来源」控件
+				"amount_dest":      "金额去向", // 2026-09-21 新增：对齐「27-流水登记」的「金额去向」控件
 				"registrant":       "登记人",
 				"registered_at":    "登记时间",
 				"invoice_progress": "发票收集进度（待配置）",
@@ -190,6 +197,21 @@ func DefaultDict() Dict {
 				"project_name": "widget17812356472430001",
 				"detail":       "widget16510609006710001",
 				"image":        "widget16510609389860001",
+				// 「费用明细」明细控件里的三个子控件（建单/测试要用）
+				"detail_name":   "widget16510609105290001",
+				"detail_amount": "widget16510609358260001",
+				"detail_qty":    "widget16510609215120001",
+			},
+			// 「27-流水登记」表单控件（2026-09-21 只读读到的 8 个控件）。
+			RoleLedgerRegister: {
+				"date":            "widget16487160384360001", // 转账日期（date）
+				"kind":            "widget17319363822710001", // 类型（radioV2：转入/支出）
+				"transfer_amount": "widget16487160475640001", // 转账金额（amount）
+				"expense_amount":  "widget17319364514860001", // 支出金额（amount）
+				"source":          "widget17303849526100001", // 金额来源（radioV2）
+				"destination":     "widget17319364643930001", // 金额去向（radioV2）
+				"screenshot":      "widget16487161419060001", // 转账截图（attachmentV2）
+				"note":            "widget16487161430270001", // 备注（textarea）
 			},
 		},
 		Options: map[string]map[string]map[string]string{
@@ -206,6 +228,21 @@ func DefaultDict() Dict {
 				"采购类别": {
 					"机械成品件": "l2hj0e3b-x7ckiyvutmb-0", "机械加工件": "l2hj0e3h-so9egdaof-1",
 					"电控物资": "l2hj0e3h-81aosv8klcb-3", "其他": "l2hj0e3h-6t5pibskxcq-5",
+				},
+			},
+			// 「27-流水登记」的单选项内部值（创建实例时单选必须传 value，不能传文字）。
+			RoleLedgerRegister: {
+				"类型": {
+					"转入": "m3n27dc0-euksyzgrrz-0", "支出": "m3n27dc0-gpddu5bqtma-0",
+				},
+				"金额来源": {
+					"学校报销": "$i18n-m2xeg1m2-dtjfn4a6ndd-8", "竞赛经费": "m2xek5tw-pi5yii5a0s7-1",
+					"众筹资金（个人补贴）": "m2xek5tw-89y3di7otih-3", "大创经费": "m2xek5tw-o62ab6m6vpi-5",
+					"指导老师垫付": "m2xek5tw-c78pchsqron-7",
+				},
+				"金额去向": {
+					"指导老师还款": "m3n294p6-ypo3fzid12s-0", "个人垫付还款": "m3n294p6-ujd0s1hqu68-0",
+					"物资购买": "m40u8hze-vukqk2r3ftl-1", "差旅垫付": "m3n294p6-19178gxt9m4-0",
 				},
 			},
 		},

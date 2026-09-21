@@ -26,6 +26,8 @@ type Config struct {
 	Notify       Notify            `yaml:"notify"`
 	Paths        Paths             `yaml:"paths"`
 	Export       Export            `yaml:"export"`
+	// FlowRegister 是「27-流水登记」这一步的租户参数（登记人是谁）。
+	FlowRegister FlowRegister `yaml:"flow_register"`
 	// Dict 是静态配置字典（字段名/控件 id/选项/rules…）。用 inline 展开到顶层，
 	// 于是 config.yml 里可以直接写 approvals: / fields: / options: / rules: 等。
 	// 见 dict.go。
@@ -47,6 +49,25 @@ type Export struct {
 	// MaxFilesPerBatch 单批文件数上限，防止一次把爆发期全拖下来。
 	MaxFilesPerBatch int `yaml:"max_files_per_batch"`
 }
+
+// FlowRegister 是「27-流水登记」的租户参数。
+//
+// 用户 2026-09-21 定的新流程：采购审批通过 → 先给**财务登记人**开一张预填好的
+// 「27-流水登记」（同时私信通知），他核对/补全后提交（该表单无审批人 → 提交即通过）
+// → 用登记单的数据**覆盖**「27 - 收支表」对应行 → 再给采购提交人开「27发票收集」。
+//
+// ★ 登记人的 user_id 属于租户数据，**刻意不写进源码**（仓库公开），只放 config.yml。
+type FlowRegister struct {
+	// UserID 是登记人的 user_id（租户内一致，跨应用通用）。
+	UserID string `yaml:"user_id"`
+	// UserName 只用于日志/消息文案（可空）。
+	UserName string `yaml:"user_name"`
+	// Disabled 置 true 时退回旧流程（采购通过直接给提交人开票），用于应急。
+	Disabled bool `yaml:"disabled"`
+}
+
+// RegisterUserID 返回登记人 user_id（未配置则空）。
+func (c *Config) RegisterUserID() string { return c.FlowRegister.UserID }
 
 // ZipEnabled 返回是否打 zip（默认 true）。
 func (e Export) ZipEnabled() bool {

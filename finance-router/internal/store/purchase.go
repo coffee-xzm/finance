@@ -21,6 +21,7 @@ type PurchaseSync struct {
 	MirrorRecordID       string
 	LedgerRecordIDs      []string
 	RequestRecordIDs     []string // 写进 wiki「27采购申请表」的行 id
+	FlowRegisterCodes    []string // 为每条明细代建的「27-流水登记」实例 code（与 LedgerRecordIDs 同序）
 	InvoiceInstanceCode  string
 	DraftState           string
 	LastError            string
@@ -31,14 +32,14 @@ type PurchaseSync struct {
 // GetPurchase 取一条采购处理记录；不存在返回 (nil,false,nil)。
 func (d *DB) GetPurchase(ctx context.Context, instanceCode string) (*PurchaseSync, bool, error) {
 	var p PurchaseSync
-	var ledger, request string
+	var ledger, request, flowReg string
 	err := d.sql.QueryRowContext(ctx, `
 		SELECT purchase_instance_code, approval_code, applicant_user_id, purchase_status,
 		       project_group, mirror_record_id, ledger_record_ids, request_record_ids,
-		       invoice_instance_code, draft_state, last_error, created_at, updated_at
+		       flow_register_codes, invoice_instance_code, draft_state, last_error, created_at, updated_at
 		  FROM purchase_sync WHERE purchase_instance_code = ?`, instanceCode).
 		Scan(&p.PurchaseInstanceCode, &p.ApprovalCode, &p.ApplicantUserID, &p.PurchaseStatus,
-			&p.ProjectGroup, &p.MirrorRecordID, &ledger, &request, &p.InvoiceInstanceCode,
+			&p.ProjectGroup, &p.MirrorRecordID, &ledger, &request, &flowReg, &p.InvoiceInstanceCode,
 			&p.DraftState, &p.LastError, &p.CreatedAt, &p.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
@@ -52,6 +53,9 @@ func (d *DB) GetPurchase(ctx context.Context, instanceCode string) (*PurchaseSyn
 	if request != "" {
 		_ = json.Unmarshal([]byte(request), &p.RequestRecordIDs)
 	}
+	if flowReg != "" {
+		_ = json.Unmarshal([]byte(flowReg), &p.FlowRegisterCodes)
+	}
 	return &p, true, nil
 }
 
@@ -64,12 +68,13 @@ func (d *DB) UpsertPurchase(ctx context.Context, p PurchaseSync) error {
 	p.UpdatedAt = now
 	ledger, _ := json.Marshal(p.LedgerRecordIDs)
 	request, _ := json.Marshal(p.RequestRecordIDs)
+	flowReg, _ := json.Marshal(p.FlowRegisterCodes)
 	_, err := d.sql.ExecContext(ctx, `
 		INSERT INTO purchase_sync (
 			purchase_instance_code, approval_code, applicant_user_id, purchase_status,
 			project_group, mirror_record_id, ledger_record_ids, request_record_ids,
-			invoice_instance_code, draft_state, last_error, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+			flow_register_codes, invoice_instance_code, draft_state, last_error, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(purchase_instance_code) DO UPDATE SET
 			approval_code=excluded.approval_code,
 			applicant_user_id=excluded.applicant_user_id,
@@ -78,13 +83,14 @@ func (d *DB) UpsertPurchase(ctx context.Context, p PurchaseSync) error {
 			mirror_record_id=excluded.mirror_record_id,
 			ledger_record_ids=excluded.ledger_record_ids,
 			request_record_ids=excluded.request_record_ids,
+			flow_register_codes=excluded.flow_register_codes,
 			invoice_instance_code=excluded.invoice_instance_code,
 			draft_state=excluded.draft_state,
 			last_error=excluded.last_error,
 			updated_at=excluded.updated_at`,
 		p.PurchaseInstanceCode, p.ApprovalCode, p.ApplicantUserID, p.PurchaseStatus,
-		p.ProjectGroup, p.MirrorRecordID, string(ledger), string(request), p.InvoiceInstanceCode,
-		p.DraftState, p.LastError, p.CreatedAt, p.UpdatedAt)
+		p.ProjectGroup, p.MirrorRecordID, string(ledger), string(request), string(flowReg),
+		p.InvoiceInstanceCode, p.DraftState, p.LastError, p.CreatedAt, p.UpdatedAt)
 	return err
 }
 
@@ -102,14 +108,14 @@ func (d *DB) PurchaseByInvoice(ctx context.Context, invoiceInstanceCode string) 
 		return nil, false, nil
 	}
 	var p PurchaseSync
-	var ledger, request string
+	var ledger, request, flowReg string
 	err := d.sql.QueryRowContext(ctx, `
 		SELECT purchase_instance_code, approval_code, applicant_user_id, purchase_status,
 		       project_group, mirror_record_id, ledger_record_ids, request_record_ids,
-		       invoice_instance_code, draft_state, last_error, created_at, updated_at
+		       flow_register_codes, invoice_instance_code, draft_state, last_error, created_at, updated_at
 		  FROM purchase_sync WHERE invoice_instance_code = ? LIMIT 1`, invoiceInstanceCode).
 		Scan(&p.PurchaseInstanceCode, &p.ApprovalCode, &p.ApplicantUserID, &p.PurchaseStatus,
-			&p.ProjectGroup, &p.MirrorRecordID, &ledger, &request, &p.InvoiceInstanceCode,
+			&p.ProjectGroup, &p.MirrorRecordID, &ledger, &request, &flowReg, &p.InvoiceInstanceCode,
 			&p.DraftState, &p.LastError, &p.CreatedAt, &p.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
@@ -122,6 +128,9 @@ func (d *DB) PurchaseByInvoice(ctx context.Context, invoiceInstanceCode string) 
 	}
 	if request != "" {
 		_ = json.Unmarshal([]byte(request), &p.RequestRecordIDs)
+	}
+	if flowReg != "" {
+		_ = json.Unmarshal([]byte(flowReg), &p.FlowRegisterCodes)
 	}
 	return &p, true, nil
 }

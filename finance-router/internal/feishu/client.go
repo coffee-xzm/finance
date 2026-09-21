@@ -1149,6 +1149,81 @@ func (c *Client) UploadMedia(ctx context.Context, appToken, parentType, fileName
 		})
 }
 
+// UploadApprovalFile 把文件上传到**审批系统**，返回可用于创建审批实例的 file code。
+//
+// 为什么不能复用「27-流水登记」里的附件：审批实例详情里的附件值是**带 authcode 的
+// 下载直链**（24h 失效），不是 file code；给新的审批实例的附件控件赋值必须用
+// 「上传文件」接口返回的 code —— 官方文档：
+// https://open.feishu.cn/document/server-docs/approval-v4/file/upload-files
+//
+// ★ 注意这个接口**不在 open-apis 前缀下**（路径是 /approval/openapi/v2/file/upload），
+// 所以这里不走 c.baseURL，而是换成平台对应域名。
+// 权限：approval:approval:readonly。
+func (c *Client) UploadApprovalFile(ctx context.Context, fileName, kind string, data []byte) (string, error) {
+	if kind == "" {
+		kind = "attachment"
+	}
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	if err := mw.WriteField("name", fileName); err != nil {
+		return "", err
+	}
+	if err := mw.WriteField("type", kind); err != nil {
+		return "", err
+	}
+	fw, err := mw.CreateFormFile("content", fileName)
+	if err != nil {
+		return "", err
+	}
+	if _, err := fw.Write(data); err != nil {
+		return "", err
+	}
+	if err := mw.Close(); err != nil {
+		return "", err
+	}
+	uploadURL := c.approvalUploadURL()
+
+	return doWithRetryT(c, ctx, http.MethodPost, "/approval/openapi/v2/file/upload",
+		func() (*http.Request, error) {
+			token, err := c.TenantAccessToken(ctx)
+			if err != nil {
+				return nil, err
+			}
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+				uploadURL, bytes.NewReader(buf.Bytes()))
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", mw.FormDataContentType())
+			return req, nil
+		},
+		func(data json.RawMessage) (string, error) {
+			var out struct {
+				Code string `json:"code"`
+			}
+			if err := json.Unmarshal(data, &out); err != nil {
+				return "", fmt.Errorf("解析审批文件上传响应: %w", err)
+			}
+			if out.Code == "" {
+				return "", fmt.Errorf("审批文件上传响应里没有 code: %s", truncate(data, 200))
+			}
+			return out.Code, nil
+		})
+}
+
+// approvalUploadURL 由 baseURL 推出审批「上传文件」接口的完整地址。
+//
+// 国内租户的 open api 在 open.feishu.cn/open-apis，而审批上传在 www.feishu.cn；
+// Lark（国际版）同理。认不出来时按国内处理。
+func (c *Client) approvalUploadURL() string {
+	host := "https://www.feishu.cn"
+	if strings.Contains(c.baseURL, "larksuite") {
+		host = "https://www.larksuite.com"
+	}
+	return host + "/approval/openapi/v2/file/upload"
+}
+
 // DeleteBitableTable 删除一张数据表（★ 破坏性操作）。
 // 权限：base:table:delete 或 bitable:app。
 func (c *Client) DeleteBitableTable(ctx context.Context, appToken, tableID string) error {

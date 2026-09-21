@@ -223,7 +223,7 @@ func TestBuildInvoiceForm(t *testing.T) {
 	}
 	depts := map[string]string{"视觉组": "od-00000000000000000000000000000000"}
 
-	form, notes := buildInvoiceForm(cfg, info, depts)
+	form, notes := buildInvoiceForm(cfg, info, depts, nil)
 	if len(form) != 3 {
 		t.Fatalf("表单应预填 3 项（购买人/部门/名称），实际 %d: %#v", len(form), form)
 	}
@@ -276,7 +276,7 @@ func TestBuildInvoiceFormNameOptional(t *testing.T) {
 
 	// ① 费用明细没有名称 → 不写（注意：项目名称有值也不顶用）
 	form, _ := buildInvoiceForm(cfg, &purchaseInfo{
-		ProjectGroup: "视觉组", ProjectName: "测试", ApplicantID: "u1"}, nil)
+		ProjectGroup: "视觉组", ProjectName: "测试", ApplicantID: "u1"}, nil, nil)
 	if formItem(t, form, id) != nil {
 		t.Error("费用明细名称为空时不应写「名称」")
 	}
@@ -287,7 +287,7 @@ func TestBuildInvoiceFormNameOptional(t *testing.T) {
 	// ② 后缀配成空串 → 只填明细名称，不加后缀
 	cfg.Dict.PurchaseToInvoice.NameSuffix = ""
 	form2, _ := buildInvoiceForm(cfg, &purchaseInfo{
-		ProjectGroup: "视觉组", Items: []purchaseItem{{Name: "QWER"}}}, nil)
+		ProjectGroup: "视觉组", Items: []purchaseItem{{Name: "QWER"}}}, nil, nil)
 	name2 := formItem(t, form2, id)
 	if name2 == nil || name2["value"] != "QWER" {
 		t.Errorf("后缀为空时「名称」应为 QWER，实际 %#v", name2)

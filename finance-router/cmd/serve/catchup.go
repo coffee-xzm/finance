@@ -113,6 +113,19 @@ func (s *service) catchUpSweep(ctx context.Context) {
 				}
 				fmt.Printf("  ⟳ 补漏：采购 %s 已通过但本地没处理过 → 补跑\n", short(code))
 
+			case a.Role == config.RoleLedgerRegister:
+				if !approved {
+					continue
+				}
+				// 幂等锚点：本地已记 applied 就不用再覆盖一遍
+				if r, ok, _ := s.db.GetFlowRegister(ctx, code); ok && r.State == store.FlowRegisterApplied {
+					continue
+				}
+				if !sweepFirstSeen(code) {
+					continue
+				}
+				fmt.Printf("  ⟳ 补漏：流水登记 %s 已通过但还没覆盖流水行 → 补跑\n", short(code))
+
 			default: // invoice_collect
 				switch {
 				case approved:

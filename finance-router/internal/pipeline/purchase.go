@@ -233,36 +233,110 @@ func RunPurchase(ctx context.Context, opts PurchaseOptions) error {
 		}
 	}
 
-	// ── ④ 代建 27发票收集 + 退回到发起人 ──
+	// ── ④ 给财务登记人开「27-流水登记」（每条明细一张），退回发起 + 私信通知 ──
+	//
+	// 用户 2026-09-21 定的新流程：采购通过后**先不**给提交人开发票单，
+	// 先让流水登记人核对/补齐（登记数据为准），全部明细都登记完成后
+	// 由 maybeCreateInvoiceForPurchase() 再给提交人开票。
+	//
+	// 未配登记人（或 flow_register.disabled）时退回旧行为：直接开票 ——
+	// 这样配置没到位也不会把链路卡死。
+	registerCodes := make([]string, len(info.Items))
+	if prev, ok, _ := db.GetPurchase(ctx, info.InstanceCode); ok {
+		copy(registerCodes, prev.FlowRegisterCodes)
+	}
 	invoiceCode := ""
-	if inv, ok := cfg.ApprovalByRole(config.RoleInvoiceCollect); ok && inv.Code != "" {
-		prevInv := ""
-		if prev, ok, _ := db.GetPurchase(ctx, info.InstanceCode); ok {
-			prevInv = prev.InvoiceInstanceCode
-		}
-		switch {
-		case prevInv != "" && !opts.Force:
-			invoiceCode = prevInv
-			fmt.Printf("  = 发票单已代建过（%s），跳过\n", short(invoiceCode))
-		case opts.DryRun:
-			fmt.Printf("  [dry-run] 将代建发票单（提交人=%s，名称=%s，预填购买人/物资所属部门）\n",
-				info.ApplicantID, invoiceName(cfg, info))
-		default:
-			invoiceCode, err = createInvoiceDraft(ctx, cfg, client, db, deptByName, inv.Code, info)
+	registerAppr, hasRegister := cfg.ApprovalByRole(config.RoleLedgerRegister)
+	useRegister := hasRegister && registerAppr.Code != "" && cfg.RegisterUserID() != "" && !cfg.FlowRegister.Disabled
+	switch {
+	case useRegister:
+		created := 0
+		for i, it := range info.Items {
+			if registerCodes[i] != "" && !opts.Force {
+				fmt.Printf("  = 明细 %d 的流水登记单已代建过（%s），跳过\n", i+1, short(registerCodes[i]))
+				continue
+			}
+			if opts.DryRun {
+				form, _ := buildFlowRegisterForm(cfg, info, it, info.FinishTimeMS)
+				b, _ := json.Marshal(form)
+				fmt.Printf("  [dry-run] 流水登记单 %d（登记人=%s）: %s\n",
+					i+1, cfg.RegisterUserID(), trunc(string(b), 320))
+				continue
+			}
+			code, err := createFlowRegisterDraft(ctx, cfg, client, registerAppr.Code,
+				info, it, i+1, info.FinishTimeMS)
 			if err != nil {
-				// 发票单失败不掩盖流水已写：记状态，返回错误让人看见
+				// 已建出来的登记单必须落本地，否则重跑会重复建（UUID 冲突）
 				_ = db.UpsertPurchase(ctx, store.PurchaseSync{
 					PurchaseInstanceCode: info.InstanceCode, ApprovalCode: info.ApprovalCode,
 					ApplicantUserID: info.ApplicantID, PurchaseStatus: status,
 					ProjectGroup: info.ProjectGroup, MirrorRecordID: mirrorID,
 					LedgerRecordIDs: ledgerIDs, RequestRecordIDs: requestIDs,
-					InvoiceInstanceCode: invoiceCode,
-					DraftState:          "failed", LastError: err.Error(),
+					FlowRegisterCodes: registerCodes,
+					DraftState:        "failed", LastError: err.Error(),
 				})
-				return fmt.Errorf("代建发票单失败（流水已写 %d 行）: %w", len(ledgerIDs), err)
+				return fmt.Errorf("代建流水登记单（明细 %d）失败: %w", i+1, err)
 			}
-			fmt.Printf("  ✓ 已代建发票单 %s 并退回发起人\n", short(invoiceCode))
-			_ = notifyApplicant(ctx, cfg, client, info, invoiceCode)
+			registerCodes[i] = code
+			created++
+			// 流水行的「流水审批ID」（主字段）指向登记单 —— 也是覆盖时的幂等锚点
+			if i < len(ledgerIDs) {
+				if fid := cfg.Field("ledger", "flow_id"); fid != "" {
+					if err := client.UpdateBitableRecord(ctx, flowBase.AppToken, flowApp, ledgerIDs[i],
+						map[string]any{fid: map[string]string{
+							"link": buildApprovalApplink(cfg, code), "text": "查看流水登记"}}); err != nil {
+						fmt.Printf("  ⚠ 流水行 %s 的「流水审批ID」写入失败（不影响登记）: %v\n", ledgerIDs[i], err)
+					}
+				}
+			}
+			if err := db.UpsertFlowRegister(ctx, store.FlowRegisterSync{
+				InstanceCode:         code,
+				PurchaseInstanceCode: info.InstanceCode,
+				LedgerRecordID:       ledgerRecordIDAt(ledgerIDs, i),
+				ItemIndex:            i + 1,
+				State:                store.FlowRegisterAwaiting,
+			}); err != nil {
+				fmt.Printf("  ⚠ 登记单本地留痕失败（不影响流程）: %v\n", err)
+			}
+			fmt.Printf("  ✓ 流水登记单 %d = %s（已退回发起，待 %s 提交）\n", i+1, short(code), cfg.RegisterUserID())
+		}
+		if created > 0 {
+			var names []string
+			for _, it := range info.Items {
+				names = append(names, it.Name)
+			}
+			_ = notifyRegistrant(ctx, cfg, client, info, registerCodes, names)
+		}
+	default:
+		if inv, ok := cfg.ApprovalByRole(config.RoleInvoiceCollect); ok && inv.Code != "" {
+			prevInv := ""
+			if prev, ok, _ := db.GetPurchase(ctx, info.InstanceCode); ok {
+				prevInv = prev.InvoiceInstanceCode
+			}
+			switch {
+			case prevInv != "" && !opts.Force:
+				invoiceCode = prevInv
+				fmt.Printf("  = 发票单已代建过（%s），跳过\n", short(invoiceCode))
+			case opts.DryRun:
+				fmt.Printf("  [dry-run] 将代建发票单（提交人=%s，名称=%s，预填购买人/物资所属部门）\n",
+					info.ApplicantID, invoiceName(cfg, info))
+			default:
+				invoiceCode, err = createInvoiceDraft(ctx, cfg, client, db, deptByName, inv.Code, info, nil)
+				if err != nil {
+					// 发票单失败不掩盖流水已写：记状态，返回错误让人看见
+					_ = db.UpsertPurchase(ctx, store.PurchaseSync{
+						PurchaseInstanceCode: info.InstanceCode, ApprovalCode: info.ApprovalCode,
+						ApplicantUserID: info.ApplicantID, PurchaseStatus: status,
+						ProjectGroup: info.ProjectGroup, MirrorRecordID: mirrorID,
+						LedgerRecordIDs: ledgerIDs, RequestRecordIDs: requestIDs,
+						InvoiceInstanceCode: invoiceCode,
+						DraftState:          "failed", LastError: err.Error(),
+					})
+					return fmt.Errorf("代建发票单失败（流水已写 %d 行）: %w", len(ledgerIDs), err)
+				}
+				fmt.Printf("  ✓ 已代建发票单 %s 并退回发起人\n", short(invoiceCode))
+				_ = notifyApplicant(ctx, cfg, client, info, invoiceCode)
+			}
 		}
 	}
 
@@ -273,15 +347,25 @@ func RunPurchase(ctx context.Context, opts PurchaseOptions) error {
 			ApplicantUserID: info.ApplicantID, PurchaseStatus: status,
 			ProjectGroup: info.ProjectGroup, MirrorRecordID: mirrorID,
 			LedgerRecordIDs: ledgerIDs, RequestRecordIDs: requestIDs,
+			FlowRegisterCodes:   registerCodes,
 			InvoiceInstanceCode: invoiceCode,
 			DraftState:          "awaiting_applicant",
 		}); err != nil {
 			return fmt.Errorf("写本地采购记录失败: %w", err)
 		}
 	}
-	fmt.Printf("✓ 采购 %s 处理完成（流水 %d 行，发票单 %s）\n",
-		short(info.InstanceCode), len(ledgerIDs), short(invoiceCode))
+	fmt.Printf("✓ 采购 %s 处理完成（流水 %d 行，流水登记 %d 张，发票单 %s）\n",
+		short(info.InstanceCode), len(ledgerIDs), len(registerCodes), short(invoiceCode))
 	return nil
+}
+
+// ledgerRecordIDAt 安全取第 i 个流水行 id（明细数与流水行数理论上一一对应，
+// 但表被人手动删过行时可能短，这里不 panic）。
+func ledgerRecordIDAt(ids []string, i int) string {
+	if i >= 0 && i < len(ids) {
+		return ids[i]
+	}
+	return ""
 }
 
 // parsePurchase 抽取采购审批里我们需要的字段。
@@ -712,9 +796,10 @@ func ledgerNote(info *purchaseInfo, it purchaseItem) string {
 
 // createInvoiceDraft 代建「27发票收集」并退回到发起人；返回新实例 code。
 func createInvoiceDraft(ctx context.Context, cfg *config.Config, client *feishu.Client,
-	db *store.DB, deptByName map[string]string, invoiceCode string, info *purchaseInfo) (string, error) {
+	db *store.DB, deptByName map[string]string, invoiceCode string, info *purchaseInfo,
+	payTokens []string) (string, error) {
 
-	form, notes := buildInvoiceForm(cfg, info, deptByName)
+	form, notes := buildInvoiceForm(cfg, info, deptByName, payTokens)
 	for _, n := range notes {
 		fmt.Printf("  预填 %s\n", n)
 	}
@@ -765,7 +850,7 @@ func createInvoiceDraft(ctx context.Context, cfg *config.Config, client *feishu.
 // 取不到值的控件**不写**（留空让发起人自己填），不写空串占位。
 // 纯函数：不碰网络，便于单测覆盖。
 func buildInvoiceForm(cfg *config.Config, info *purchaseInfo,
-	deptByName map[string]string) (form []map[string]any, notes []string) {
+	deptByName map[string]string, payTokens []string) (form []map[string]any, notes []string) {
 
 	form = []map[string]any{}
 	if id := cfg.Control(config.RoleInvoiceCollect, "buyer"); id != "" && info.ApplicantID != "" {
@@ -782,6 +867,11 @@ func buildInvoiceForm(cfg *config.Config, info *purchaseInfo,
 			notes = append(notes, fmt.Sprintf("⚠ 项目组 %s（别名 %s）解析不到部门 open_department_id，物资所属部门留空",
 				info.ProjectGroup, deptName))
 		}
+	}
+	if id := cfg.Control(config.RoleInvoiceCollect, "payment_att"); id != "" && len(payTokens) > 0 {
+		// 「付款记录」= 流水登记里的转账截图（已上传审批系统换到的 file code）
+		form = append(form, map[string]any{"id": id, "type": "attachmentV2", "value": payTokens})
+		notes = append(notes, fmt.Sprintf("付款记录 = %d 张转账截图", len(payTokens)))
 	}
 	if id := cfg.Control(config.RoleInvoiceCollect, "name"); id != "" {
 		if v := invoiceName(cfg, info); v != "" {
@@ -833,27 +923,39 @@ func notifyApplicant(ctx context.Context, cfg *config.Config, client *feishu.Cli
 	link := buildApprovalApplink(cfg, invoiceCode)
 	text := fmt.Sprintf("【发票收集】采购审批「%s」已通过，已为你创建「27发票收集」审批。\n"+
 		"请补充发票 / 订单截图 / 付款记录后提交：\n%s", info.ProjectName, link)
-	err := client.SendTextMessage(ctx, "user_id", info.ApplicantID, text)
+	return sendWithAdminFallback(ctx, cfg, client, info.ApplicantID, text,
+		fmt.Sprintf("采购「%s」已通过并已代建发票单，请手动提醒他补齐发票/订单截图/付款记录后提交：\n%s",
+			info.ProjectName, link))
+}
+
+// sendWithAdminFallback 给某人发私信；失败时（典型是 230013 机器人可用范围不含此人）
+// 打印根治路径并改用管理员兜底，保证"该提醒谁"这件事不会凭空消失。
+//
+// fallbackHint 是发给管理员的正文（复用同一个上下文）。
+func sendWithAdminFallback(ctx context.Context, cfg *config.Config, client *feishu.Client,
+	userID, text, fallbackHint string) error {
+
+	if userID == "" {
+		return fmt.Errorf("收件人 user_id 为空，无法通知")
+	}
+	err := client.SendTextMessage(ctx, "user_id", userID, text)
 	if err == nil {
 		return nil
 	}
-	fmt.Printf("  ⚠ 通知发起人失败（不影响流程）: %v\n", err)
-
+	fmt.Printf("  ⚠ 通知 %s 失败（不影响流程）: %v\n", userID, err)
 	if strings.Contains(err.Error(), "230013") {
-		fmt.Println("     ↳ 机器人可用范围不含该提交人：飞书开发者后台 → 该应用 → 机器人/可用范围，" +
-			"把提交人本人（或其部门）加进去")
+		fmt.Println("     ↳ 机器人可用范围不含该用户：飞书开发者后台 → 该应用 → 机器人/可用范围，" +
+			"把该用户（或其部门）加进去")
 	}
 	admin := cfg.Feishu.AdminUserID
-	if admin == "" || admin == info.ApplicantID {
+	if admin == "" || admin == userID {
 		return err
 	}
-	warn := fmt.Sprintf("⚠ 无法私信提醒提交人（user_id=%s）。\n采购「%s」已通过并已代建发票单，"+
-		"请手动提醒他补齐发票/订单截图/付款记录后提交：\n%s\n\n飞书返回：%v",
-		info.ApplicantID, info.ProjectName, link, err)
+	warn := fmt.Sprintf("⚠ 无法私信提醒（user_id=%s）。\n%s\n\n飞书返回：%v", userID, fallbackHint, err)
 	if e2 := client.SendTextMessage(ctx, "user_id", admin, warn); e2 != nil {
 		fmt.Printf("  ⚠ 改通知管理员也失败: %v\n", e2)
 	} else {
-		fmt.Printf("  ✓ 已改通知管理员（user_id=%s）：请手动提醒提交人\n", admin)
+		fmt.Printf("  ✓ 已改通知管理员（user_id=%s）\n", admin)
 	}
 	return err
 }

@@ -31,6 +31,7 @@ const (
 	TypePhone        FieldType = 13
 	TypeURL          FieldType = 15 // 超链接
 	TypeAttachment   FieldType = 17 // 附件
+	TypeSingleLink   FieldType = 18 // 单向关联（写 record_id 数组）
 	// 只读，不可作为写入目标：
 	TypeLookup     FieldType = 19
 	TypeFormula    FieldType = 20
@@ -225,5 +226,55 @@ func PurchaseRequestTable() Table {
 		Description: "采购审批通过后写入；字段对齐参考表 tbllUFPS…。" +
 			"主字段为「项目名称」（参考表主字段是 URL 的「申请编号」，不便照搬）。",
 		Fields: f,
+	}
+}
+
+// LedgerTable 是「27 - 收支表」的结构契约（flow base）。
+//
+// 为什么要在这里定义：这张表是**线上生产表**，结构由用户维护，但它现在是
+// 「27-流水登记」审批的落地目标 —— 登记表单的控件必须有对应列可写，
+// 所以缺的列由 `cmd/ledger-init` 按这份清单补齐（见 docs/30-review/33 §12.15）。
+//
+// 只读列（登记人/登记时间/当前金额/余额段）+ 主字段「流水审批ID」**不在此列**：
+// 前者不能写，后者由用户在表里改成 Url 类型（我们只写值）。
+// 这里列出的是"本服务会写"的列 + 需要存在的列。
+func LedgerTable() Table {
+	f := []Field{
+		{Name: "流水审批ID", Type: TypeURL,
+			Note: "主字段：本行对应的「27-流水登记」实例深链（幂等锚点）", SourceOfTruth: "local"},
+		{Name: "🔗 关联发票任务", Type: TypeAttachment, SourceOfTruth: "human"},
+		{Name: "🔗 科目 / 去向", Type: TypeSingleSelect,
+			Options: []string{"项目组物资", "技术组物资", "差旅相关", "个人/老师还款",
+				"裁判系统赔款", "官方物资", "其他（备注）"}, SourceOfTruth: "form"},
+		{Name: "收支方向（支出/收入）", Type: TypeSingleSelect,
+			Options: []string{"当前本金", "支出", "收入"}, SourceOfTruth: "form"},
+		{Name: "🔗 项目组", Type: TypeSingleSelect,
+			Options: []string{"机械组", "宣管组", "电控组", "哨兵组", "视觉组", "步兵组",
+				"英雄组", "工程组", "无人机组", "飞镖组", "雷达组", "硬件组", "重装组"},
+			SourceOfTruth: "form"},
+		{Name: "🔗 金额", Type: TypeNumber, Formatter: "0.00", SourceOfTruth: "form"},
+		{Name: "🔗 付款/收款截图", Type: TypeAttachment,
+			Note: "登记单「转账截图」转存（临时直链 24h 失效）", SourceOfTruth: "image"},
+		{Name: "🔗 发生日期（付款/下单/到账）", Type: TypeDate, DateFmt: "yyyy/MM/dd", SourceOfTruth: "form"},
+		{Name: "🔗 关联申请单ID", Type: TypeURL, SourceOfTruth: "local"},
+		{Name: "🔗 备注", Type: TypeText, SourceOfTruth: "form"},
+		{Name: "发票收集进度（待配置）", Type: TypeSingleSelect,
+			Options: []string{"待办", "已通过"}, SourceOfTruth: "local"},
+		{Name: "关联人", Type: TypeUser, Note: "该行对应审批的提交人", SourceOfTruth: "feishu"},
+		{Name: "金额来源", Type: TypeSingleSelect,
+			Options: []string{"学校报销", "竞赛经费", "众筹资金（个人补贴）", "大创经费", "指导老师垫付"},
+			Note:    "2026-09-21 新增：对齐登记表单的「金额来源」控件", SourceOfTruth: "form"},
+		{Name: "金额去向", Type: TypeSingleSelect,
+			Options: []string{"指导老师还款", "个人垫付还款", "物资购买", "差旅垫付"},
+			Note:    "2026-09-21 新增：对齐登记表单的「金额去向」控件", SourceOfTruth: "form"},
+		{Name: "27 - 流动资金采购审批", Type: TypeSingleLink,
+			Note: "单向关联到采购镜像表（写 record_id 数组）", SourceOfTruth: "local"},
+	}
+	return Table{
+		Key:         "ledger",
+		Name:        "27 - 收支表",
+		Authority:   "服务写（采购派生 + 流水登记覆盖）",
+		Description: "一行 = 一笔流水（采购的每条费用明细一行）。登记单通过后按登记数据覆盖。",
+		Fields:      f,
 	}
 }

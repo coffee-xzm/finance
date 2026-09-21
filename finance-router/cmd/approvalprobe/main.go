@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,6 +39,11 @@ func main() {
 	harvest := flag.Bool("harvest", false, "只读：从历史实例里采集 部门名→open_department_id")
 	detail := flag.String("detail", "", "只读：打印实例状态/任务/时间线")
 	create := flag.Bool("create", false, "★写：创建一个 27发票收集 测试实例")
+	createPurchase := flag.Bool("create-purchase", false,
+		"★写：创建一个「采购审批」测试实例（2 条费用明细，走完整采购→流水登记链路）")
+	purchaseGroup := flag.String("purchase-group", "视觉组", "-create-purchase 的项目组")
+	purchaseAmounts := flag.String("purchase-amounts", "12.5,7", "-create-purchase 的各条明细单价（逗号分隔）")
+	purchaseQtys := flag.String("purchase-qtys", "2,1", "-create-purchase 的各条明细数量（逗号分隔）")
 	approve := flag.String("approve", "", "★写：同意该实例的全部 PENDING 任务")
 	rollback := flag.String("rollback", "", "★写：把该实例退回到 START（发起人）")
 	user := flag.String("user", "", "提交人 user_id（默认 config.feishu.admin_user_id）")
@@ -105,6 +111,9 @@ func main() {
 		return
 	case *create:
 		runCreate(ctx, c, *code, *user, *prefillDept, *prefillDeptID, *uuid)
+		return
+	case *createPurchase:
+		runCreatePurchase(ctx, cfg, c, *user, *purchaseGroup, *purchaseAmounts, *purchaseQtys, *uuid)
 		return
 	case *approve != "":
 		runApprove(ctx, c, *approve)
@@ -177,6 +186,75 @@ func runCreate(ctx context.Context, c *feishu.Client, code, user, deptName, dept
 	if err == nil {
 		printDetail(det)
 	}
+}
+
+// runCreatePurchase 建一条**采购审批**测试实例（P0/链路联调用）。
+//
+// 为什么需要：新流程（采购 → 流水登记 → 开票）要端到端验证，而这条链路的入口
+// 只能是"一条采购审批通过"。用测试审批表单（`采购审批 - 27Test`）建单即为此用途。
+// ★ 会真的写飞书：建实例 + （可再 -approve）同意，并触发下游流水登记/开票。
+func runCreatePurchase(ctx context.Context, cfg *config.Config, c *feishu.Client,
+	user, group, amounts, qtys, uuid string) {
+
+	appr, ok := cfg.ApprovalByRole(config.RolePurchase)
+	if !ok || appr.Code == "" {
+		die(fmt.Errorf("config 里没有 role=purchase 的审批"))
+	}
+	if uuid == "" {
+		uuid = "probe-purchase-" + time.Now().Format("20060102T150405")
+	}
+	amts := splitFloats(amounts)
+	qs := splitFloats(qtys)
+	nameID := cfg.Control(config.RolePurchase, "detail_name")
+	amtID := cfg.Control(config.RolePurchase, "detail_amount")
+	qtyID := cfg.Control(config.RolePurchase, "detail_qty")
+
+	var rows [][]map[string]any
+	names := []string{"流程测试-明细A", "流程测试-明细B", "流程测试-明细C"}
+	for i, a := range amts {
+		q := 1.0
+		if i < len(qs) {
+			q = qs[i]
+		}
+		rows = append(rows, []map[string]any{
+			{"id": nameID, "type": "input", "value": names[i%len(names)]},
+			{"id": amtID, "type": "amount", "value": a, "currency": "CNY"},
+			{"id": qtyID, "type": "number", "value": q},
+		})
+	}
+	form := []map[string]any{
+		{"id": cfg.Control(config.RolePurchase, "group"), "type": "radioV2",
+			"value": cfg.OptionValue(config.RolePurchase, "项目组", group)},
+		{"id": cfg.Control(config.RolePurchase, "category"), "type": "radioV2",
+			"value": cfg.OptionValue(config.RolePurchase, "采购类别", "其他")},
+		{"id": cfg.Control(config.RolePurchase, "project_name"), "type": "input",
+			"value": "流水登记流程测试"},
+		{"id": cfg.Control(config.RolePurchase, "detail"), "type": "fieldList", "value": rows},
+	}
+	newCode, err := c.CreateInstance(ctx, feishu.CreateInstanceRequest{
+		ApprovalCode: appr.Code, UserID: user, Form: form, UUID: uuid, AllowResubmit: true,
+	})
+	if err != nil {
+		die(err)
+	}
+	fmt.Printf("✓ 已创建采购审批测试实例 %s（提交人=%s，项目组=%s，%d 条明细）\n",
+		newCode, user, group, len(amts))
+	fmt.Printf("  下一步：go run ./cmd/approvalprobe -approve %s\n", newCode)
+}
+
+// splitFloats 解析 "12.5,7" 这样的数字列表。
+func splitFloats(s string) []float64 {
+	var out []float64
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if v, err := strconv.ParseFloat(part, 64); err == nil {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func runApprove(ctx context.Context, c *feishu.Client, instanceCode string) {

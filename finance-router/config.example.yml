@@ -36,6 +36,9 @@ feishu:
     - role: purchase
       code: ""                 # 采购审批-27Test
       name_expect: ""          # 例如 "采购审批 - 27Test"
+    - role: ledger_register
+      code: ""                 # 27-流水登记（采购通过后先开这张单，见 docs/30-review/33 §12.15）
+      name_expect: ""          # 例如 "27-流水登记"
 
   # 拼审批 applink 用的飞书审批小程序 appId。
   # 留空 = 用内置平台默认值（该值所有租户相同，不是本项目的 app_id）。一般不用改。
@@ -182,6 +185,18 @@ write_policy:
 triggers:
   archive_on_approval_approved: true   # 审批通过 → 归档（不再每次新审批扫全表）
   auto_approve_when_clean: true        # 全部行无问题 → 自动同意审批
+
+# ── 采购通过后的第二步：27-流水登记（2026-09-21 新流程）─────────────
+# 采购审批通过 → 写收支表 → 给下面的「登记人」开预填好的「27-流水登记」
+# （退回发起 + 私信通知）→ 他核对/补齐后提交（该表单无审批人，提交即通过）
+# → 用登记数据覆盖收支表那一行 → 该采购所有明细都登记完后，才给采购提交人开
+# 「27发票收集」（预填 + 转账截图作为「付款记录」）。
+#
+# ★ 不配 user_id（或 disabled: true）= 退回旧流程：采购通过直接给提交人开票。
+flow_register:
+  user_id: ""       # 登记人的 user_id（租户内一致；从通讯录/审批事件里取）
+  user_name: ""     # 只用于日志与消息文案，可空
+  disabled: false
 
 # 采购 → 发票收集 的落地方式：创建后退回 START，由发起人补充后重提
 purchase_to_invoice:

@@ -569,6 +569,29 @@ func (s *service) process(ctx context.Context, j job) {
 		return
 	}
 
+	// ★ 流水登记链路：登记单通过 → 用登记数据**覆盖**流水行（用户：以登记数据为准），
+	//   并在该采购所有明细都登记完成后给提交人开「27发票收集」。
+	//   ★ 必须放在"退回剔除"之前：登记单的状态机与发票单完全不同（无审批人、提交即通过）。
+	if j.Role == config.RoleLedgerRegister {
+		if !strings.EqualFold(j.Status, "APPROVED") && store.StateWord(j.Status) != "已通过" {
+			fmt.Printf("  − 流水登记 %s 状态 %s，非已通过 → 不处理\n",
+				short(j.InstanceCode), store.StateWord(j.Status))
+			return
+		}
+		if err := pipeline.RunFlowRegister(ctx, pipeline.FlowRegisterOptions{
+			CfgPath: s.cfg.Path, Instance: j.InstanceCode,
+		}); err != nil {
+			s.failed.Add(1)
+			s.markEvent(ctx, j.EventID, store.EventError, err.Error())
+			fmt.Printf("  ✗ 流水登记处理失败: %v\n", err)
+			return
+		}
+		s.processed.Add(1)
+		s.markEvent(ctx, j.EventID, store.EventAccepted, "流水登记已覆盖流水行")
+		fmt.Printf("  ✓ 流水登记实例 %s 处理完成\n", short(j.InstanceCode))
+		return
+	}
+
 	// ★ 退回/拒绝/撤回类状态 → 把该单从本地库整体剔除。
 	//
 	// 需求：「被退回的就剔除掉」——原来那个多维表格只记录在审与通过的原数据。

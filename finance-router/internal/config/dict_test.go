@@ -14,8 +14,11 @@ func TestExampleConfigParses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("config.example.yml 解析失败: %v", err)
 	}
-	if len(c.Feishu.Approvals) != 2 {
-		t.Errorf("样例应有两个角色化审批，实际 %d", len(c.Feishu.Approvals))
+	if len(c.Feishu.Approvals) != 3 {
+		t.Errorf("样例应有三个角色化审批（发票收集/采购/流水登记），实际 %d", len(c.Feishu.Approvals))
+	}
+	if _, ok := c.ApprovalByRole(RoleLedgerRegister); !ok {
+		t.Error("样例应包含 role=ledger_register（27-流水登记）的审批绑定")
 	}
 	if c.Field(BaseReview, "human_review") != "人工审核" {
 		t.Error("字段字典应回落到内置默认")
@@ -48,6 +51,19 @@ func TestDictDefaults(t *testing.T) {
 	}
 	if got := c.OptionValue(RoleInvoiceCollect, "资金来源", "老师垫付"); got == "" {
 		t.Error("资金来源/老师垫付 的选项 value 缺失")
+	}
+	// 「27-流水登记」的控件与选项（2026-09-21 新流程要用）
+	if c.Control(RoleLedgerRegister, "kind") == "" || c.Control(RoleLedgerRegister, "expense_amount") == "" {
+		t.Error("ledger_register 的类型/支出金额控件 id 缺失")
+	}
+	if got := c.OptionValue(RoleLedgerRegister, "类型", "支出"); got == "" {
+		t.Error("ledger_register 类型=支出 的选项 value 缺失")
+	}
+	if c.Field("ledger", "flow_id") != "流水审批ID" {
+		t.Errorf("ledger.flow_id = %q，应为「流水审批ID」（主字段，登记单幂等锚点）", c.Field("ledger", "flow_id"))
+	}
+	if c.Field("ledger", "amount_source") != "金额来源" || c.Field("ledger", "amount_dest") != "金额去向" {
+		t.Error("ledger 的金额来源/金额去向列名不对（对齐登记表单控件名）")
 	}
 }
 
