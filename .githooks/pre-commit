@@ -29,9 +29,11 @@ BLOCKLIST="$GITDIR/secret-blocklist"
 EXTRA="$GITDIR/secret-extra"   # 手工维护：不在 config.yml 里的真实值（同样永不入库）
 
 # ── 1. 路径级：这些文件永远不该入库 ─────────────────────────
-# ★ 2026-09-21：config\.ya?ml(\\.|$) 覆盖 config.yml.bak-* / config.yml.new 这类备份
+# ★ 2026-09-21：config\.ya?ml(\.|$) 覆盖 config.yml.bak-* / config.yml.new 这类备份
 #   —— 它们同样是明文密钥（实测机器人上就留了一个 config.yml.bak-<ts>）。
-BLOCKED_PATHS='(^|/)config\.ya?ml(\\.|$)|(^|/)config\.example\.yml$|(^|/)data/|(^|/)backup/|\.db(-wal|-shm)?$|\.bundle$|(^|/)logs/|\.pem$|(^|/)id_rsa|secret-blocklist'
+#   ⚠ 注意别误伤 config.example.yml：它是要入库的配置文档（`config\.ya?ml` 后面
+#   必须是 `.` 或行尾，`config.example.yml` 不匹配，所以不要额外写 example 规则）。
+BLOCKED_PATHS='(^|/)config\.ya?ml(\.|$)|(^|/)data/|(^|/)backup/|\.db(-wal|-shm)?$|\.bundle$|(^|/)logs/|\.pem$|(^|/)id_rsa|secret-blocklist'
 hits=$(git diff --cached --name-only --diff-filter=ACMR | grep -E "$BLOCKED_PATHS" || true)
 if [ -n "$hits" ]; then
     echo "$hits" | sed 's/^/    /' >&2
