@@ -25,9 +25,13 @@ finance-router/
 ├── cmd/doctor/          逐项体检外部权限（区分 scope / 数据范围 / 字段权限）
 ├── cmd/db/              本地 SQLite：初始化迁移、统计、查重
 ├── cmd/bitable-init/    在指定文档里建好源表+整合表两张表
-├── internal/bitable/    表结构定义（字段类型编号已核实）
+├── cmd/download-probe/  附件下载链路探测（P0 门禁：临时链接/权限/extra/字节数）
+├── cmd/export/          按清单或视图导出附件 → 命名 → zip + manifest + 审计
+├── internal/bitable/    表结构定义（字段类型编号已核实）+ 字段取值读取
 ├── internal/config/     配置加载（gopkg.in/yaml.v3）
+├── internal/export/     选择性下载主流程（清单解析/下载/落盘/审计）
 ├── internal/feishu/     飞书 API 最小客户端（只读）
+├── internal/naming/     记录 → 文件名/目录（与 bitable-plugin 共用冻结向量）
 ├── config.yml           真实配置（不进 git）
 ├── config.example.yml   配置结构（进 git，唯一文档来源）
 └── data/                运行产物（不进 git）
@@ -228,6 +232,30 @@ CREATE UNIQUE INDEX uq_evidence_sha256 ON evidence(sha256);
 CREATE TRIGGER trg_audit_no_update BEFORE UPDATE ON audit_log
 BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
 ```
+
+### 8. 选择性下载（按清单导出附件）
+
+口径：**人在飞书里勾选行 → 导出成清单 → 服务端下载、命名、打包、留审计**。
+详见 `docs/30-review/32`（计划）与 `docs/30-review/35`（插件侧实操单）。
+
+```bash
+# P0 门禁：先证明这条记录的附件真的下得下来（退出码 0 = 通过）
+go run ./cmd/download-probe -table integrated -record recXXXXXXXX
+go run ./cmd/download-probe -table integrated -instance 7DB9ADCF... -out data/probe
+
+# P1 清单导出（永远先干跑）
+go run ./cmd/export -table integrated -records-file list.csv -out data/export/2026-08 -dry-run
+go run ./cmd/export -table integrated -records-file list.csv -out data/export/2026-08
+go run ./cmd/export -table integrated -view <view_id> -out data/export/2026-08   # 备选口径
+go run ./cmd/export -batches                                                     # 看历史批次（不联网）
+```
+
+| 纪律 | 落点 |
+|---|---|
+| **只存 `file_token`，不缓存临时链接**（链接 24h 失效） | `export_item` 表 + `internal/feishu/download.go` |
+| **失败不静默**：空附件行 / 缺失字段 / 下载失败都单独统计 | `manifest.csv` + 汇总行 + `NO_ATTACHMENTS` 告警 |
+| **命名与插件共用一份契约** | `internal/naming` ↔ `bitable-plugin/src/core/naming.ts`，同跑 `testdata/naming-cases.json` |
+| **审计底账**（操作人/时间/事项） | `export_batch` + `export_item`（迁移 0006） |
 
 **为什么这条索引重要**：飞书多维表格**没有任何唯一索引能力**，
 "先查重再写入"在飞书上天然是 TOCTOU 竞态（两人同时提交同一张发票，两次查重都会通过）。

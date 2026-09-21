@@ -1,0 +1,34 @@
+{
+  "name": "bitable-attachment-exporter",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "飞书多维表格侧边栏插件：选择记录 → 下载附件 → 浏览器内打包 zip（本地打包，不经任何自建服务器）",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build:core": "tsc -p tsconfig.core.json",
+    "test": "npm run build:core && node --test \"dist-test/core/**/*.test.js\"",
+    "vectors": "npm run build:core && node dist-test/core/testdata/gen-vectors.js",
+    "check:vectors": "npm run build:core && node dist-test/core/testdata/check-vectors.js",
+    "start": "vite",
+    "build": "tsc -p tsconfig.core.json && vite build",
+    "preview": "vite preview",
+    "dev": "vite"
+  },
+  "dependencies": {
+    "@lark-base-open/js-sdk": "^1.0.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "fflate": "^0.8.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  }
+}

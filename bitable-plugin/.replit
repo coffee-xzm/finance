@@ -1,0 +1,33 @@
+# Replit 运行配置。
+#
+# 与官方侧边栏插件模板一致：开发时跑 `npm run dev`（Vite dev server），
+# Replit 的 Webview 会把这个端口暴露成 *.replit.dev 的 HTTPS 地址 ——
+# 那个地址就是要填进多维表格「扩展脚本 / 插件」的**服务地址**。
+#
+# 说明：这里不写 [deployment] 段。部署（deployments）的构建/启动命令可在 Replit
+# 的 Deploy 面板里用界面配置：build = npm run build，run = npm run preview。
+# 插件地址用的是 Webview 地址（打开 Repl 时服务在跑即可），不需要付费部署。
+run = "npm run dev"
+
+entrypoint = "src/App.tsx"
+
+hidden = [".config", "tsconfig.json", "tsconfig.core.json", "vite.config.ts", ".gitignore", "scripts"]
+
+[nix]
+channel = "stable-24_05"
+
+[env]
+npm_config_cache = "/tmp/npm-cache"
+
+[packager]
+language = "nodejs"
+  [packager.features]
+  packageSearch = true
+  guessImports = true
+  enabledForHosting = false
+
+[languages]
+  [languages.typescript]
+  pattern = "**/{*.ts,*.tsx}"
+    [languages.typescript.languageServer]
+    start = "typescript-language-server --stdio"
