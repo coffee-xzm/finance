@@ -91,7 +91,8 @@ func TestLedgerNote(t *testing.T) {
 }
 
 // TestBuildLedgerFields 锁住"采购明细 → 收支表一行"的字段契约：
-// 科目按项目组规则、日期取审批完成时间、回链是数组、进度初始为待办。
+// 科目按项目组规则、日期取审批完成时间、回链是数组、进度初始为待办、
+// 关联人 = 采购审批的提交人（人员字段，open_id）。
 func TestBuildLedgerFields(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Dict = config.DefaultDict()
@@ -99,9 +100,18 @@ func TestBuildLedgerFields(t *testing.T) {
 		InstanceCode: "P-1",
 		ProjectGroup: "重装组", // 不在 tech_groups → 项目组物资
 		ProjectName:  "弧轮云台",
+		ApplicantOID: "ou_x", // 提交人 open_id → 关联人
 	}
 	it := purchaseItem{Name: "摩擦轮", Spec: "M3", Qty: 2, Amount: 234}
 	f := buildLedgerFields(cfg, info, it, "https://applink/x", "recMirror", 1789800000000)
+
+	if cfg.Field("ledger", "related_user") != "关联人" {
+		t.Errorf("字典里「关联人」列名应为 关联人，实际 %q", cfg.Field("ledger", "related_user"))
+	}
+	if arr, ok := f[cfg.Field("ledger", "related_user")].([]map[string]any); !ok ||
+		len(arr) != 1 || arr[0]["id"] != "ou_x" {
+		t.Errorf("关联人（人员字段）应是提交人 open_id，实际 %#v", f[cfg.Field("ledger", "related_user")])
+	}
 
 	if f[cfg.Field("ledger", "direction")] != "支出" {
 		t.Error("收支方向应为 支出")
@@ -134,6 +144,10 @@ func TestBuildLedgerFields(t *testing.T) {
 	}
 	if _, ok := f2[cfg.Field("ledger", "occurred_at")]; ok {
 		t.Error("没有完成时间时不应写发生日期")
+	}
+	// 拿不到提交人 open_id 时不写「关联人」（写空值会得到一行空白人员，不如留空给人填）
+	if _, ok := f2[cfg.Field("ledger", "related_user")]; ok {
+		t.Error("没有提交人 open_id 时不应写关联人")
 	}
 }
 

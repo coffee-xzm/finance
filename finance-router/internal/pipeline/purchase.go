@@ -16,6 +16,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -360,6 +361,10 @@ func parseFieldList(raw json.RawMessage) []purchaseItem {
 //
 // ★ 金额口径（用户 2026-09-21 指出）：采购表单「费用明细」里的 **金额是单价**，
 // 流水行的金额必须是 **单价 × 数量**。见 ledgerAmount()。
+//
+// ★ 关联人（用户 2026-09-21 指出，线上表 2026-09-21 新增该列，type=11 人员）：
+// 填**这行流水对应审批的提交人**，即采购审批的发起人（open_id）。
+// 与「27采购申请表」的「发起人」同一个人字段写法：[]map[string]any{{"id": open_id}}。
 func buildLedgerFields(cfg *config.Config, info *purchaseInfo, it purchaseItem,
 	applink, mirrorID string, finishMS int64) map[string]any {
 
@@ -369,6 +374,10 @@ func buildLedgerFields(cfg *config.Config, info *purchaseInfo, it purchaseItem,
 		cfg.Field("ledger", "subject"):          cfg.SubjectForGroup(info.ProjectGroup),
 		cfg.Field("ledger", "amount"):           ledgerAmount(it),
 		cfg.Field("ledger", "invoice_progress"): cfg.Dict.Rules.InvoiceProgressTodo,
+	}
+	if info.ApplicantOID != "" {
+		// 人员字段默认 user_id_type=open_id，取审批详情里的提交人 open_id。
+		f[cfg.Field("ledger", "related_user")] = []map[string]any{{"id": info.ApplicantOID}}
 	}
 	if n := ledgerNote(info, it); n != "" {
 		f[cfg.Field("ledger", "note")] = n
@@ -599,6 +608,86 @@ func ResyncPurchaseRequest(ctx context.Context, cfg *config.Config, instanceCode
 	}
 	fmt.Printf("✓ 完成，补正 %d 行\n", updated)
 	return nil
+}
+
+// ResyncPurchaseLedger 按「只填空单元格」策略补正已写过的**流水行**
+// （例如线上给「27 - 收支表」新增了「关联人」列，历史行要补上对应审批的提交人）。
+//
+// 与 ResyncPurchaseRequest 同一口径：只动空单元格，已有值一律不碰；
+// 明细按「采购表单明细顺序 ↔ 本地记录的流水行顺序」一一对应。
+func ResyncPurchaseLedger(ctx context.Context, cfg *config.Config, instanceCode string) error {
+	db, err := store.Open(cfg.Paths.DB)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	rec, ok, err := db.GetPurchase(ctx, instanceCode)
+	if err != nil {
+		return err
+	}
+	if !ok || len(rec.LedgerRecordIDs) == 0 {
+		return fmt.Errorf("本地没有采购 %s 的流水行记录", short(instanceCode))
+	}
+	flowBase, ok := cfg.Base(config.BaseFlow)
+	ledgerTbl := cfg.Table(config.BaseFlow, "ledger")
+	if !ok || ledgerTbl == "" || flowBase.AppToken == "" {
+		return fmt.Errorf("配置缺少 flow base（feishu.bitable.bases.flow）")
+	}
+	client := feishu.NewClient(cfg.Feishu.BaseURL, cfg.Feishu.AppID, cfg.Feishu.AppSecret)
+	detail, _, err := client.GetInstanceDetail(ctx, instanceCode)
+	if err != nil {
+		return err
+	}
+	info, err := parsePurchase(detail)
+	if err != nil {
+		return err
+	}
+	applink := buildApprovalApplink(cfg, instanceCode)
+
+	existing, err := client.SearchBitableRecords(ctx, flowBase.AppToken, ledgerTbl, nil, 500)
+	if err != nil {
+		return err
+	}
+	byID := map[string]feishu.BitableRecord{}
+	for _, r := range existing {
+		byID[r.RecordID] = r
+	}
+	updated := 0
+	for i, recID := range rec.LedgerRecordIDs {
+		item := purchaseItem{}
+		if i < len(info.Items) {
+			item = info.Items[i]
+		}
+		desired := buildLedgerFields(cfg, info, item, applink, rec.MirrorRecordID, info.FinishTimeMS)
+		old, ok := byID[recID]
+		if !ok {
+			fmt.Printf("  ⚠ 找不到流水行 %s，跳过\n", recID)
+			continue
+		}
+		// 只填空：不动任何已有值的单元格
+		fill := blankOnly(cfg, old.Fields, desired, nil)
+		if len(fill) == 0 {
+			fmt.Printf("  = 行 %s 没有可补的空单元格\n", recID)
+			continue
+		}
+		if err := client.UpdateBitableRecord(ctx, flowBase.AppToken, ledgerTbl, recID, fill); err != nil {
+			return fmt.Errorf("补正流水行 %s 失败: %w", recID, err)
+		}
+		updated++
+		fmt.Printf("  ✓ 补正流水行 %s：%d 个空单元格（%s）\n", recID, len(fill), strings.Join(sortedKeys(fill), "/"))
+	}
+	fmt.Printf("✓ 完成，补正 %d 行\n", updated)
+	return nil
+}
+
+// sortedKeys 返回 map 的键（排序，便于稳定打印）。
+func sortedKeys(m map[string]any) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
 }
 
 // ledgerNote 拼一条人可读的备注：项目名称 + 品名/规格/数量。

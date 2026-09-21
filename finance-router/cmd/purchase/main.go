@@ -8,6 +8,8 @@
 //	go run ./cmd/purchase -instance <采购实例code> -dry-run   # 只看要写什么
 //	go run ./cmd/purchase -instance <采购实例code>            # 真写
 //	go run ./cmd/purchase -instance <采购实例code> -force     # 忽略本地已完成标记
+//	go run ./cmd/purchase -instance <采购实例code> -resync-ledger   # 补流水行的空单元格（如「关联人」）
+//	go run ./cmd/purchase -instance <采购实例code> -resync-request  # 补采购申请表的空单元格
 package main
 
 import (
@@ -31,6 +33,8 @@ func main() {
 	show := flag.Bool("show", false, "只打印本地 purchase_sync 记录后退出")
 	onlyImages := flag.Bool("only-images", false, "只给已写过的采购申请表行补传商品图片（不改其它）")
 	resync := flag.Bool("resync-request", false, "按「只填空」补正已写的采购申请表行（如补发起人部门）")
+	resyncLedger := flag.Bool("resync-ledger", false,
+		"按「只填空」补正已写的**流水行**（如线上新增的「关联人」列）")
 	flag.Parse()
 	if *instance == "" {
 		fmt.Fprintln(os.Stderr, "✗ 必须给 -instance <采购实例code>")
@@ -81,6 +85,13 @@ func main() {
 	}
 	if *resync {
 		if err := pipeline.ResyncPurchaseRequest(ctx, cfg, *instance); err != nil {
+			fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *resyncLedger {
+		if err := pipeline.ResyncPurchaseLedger(ctx, cfg, *instance); err != nil {
 			fmt.Fprintf(os.Stderr, "✗ %v\n", err)
 			os.Exit(1)
 		}

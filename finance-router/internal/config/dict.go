@@ -145,6 +145,7 @@ func DefaultDict() Dict {
 				"occurred_at":      "🔗 发生日期（付款/下单/到账）",
 				"apply_link":       "🔗 关联申请单ID",
 				"note":             "🔗 备注",
+				"related_user":     "关联人",
 				"registrant":       "登记人",
 				"registered_at":    "登记时间",
 				"invoice_progress": "发票收集进度（待配置）",
