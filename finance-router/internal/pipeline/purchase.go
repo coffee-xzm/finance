@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/coffee/finance-router/internal/config"
 	"github.com/coffee/finance-router/internal/feishu"
@@ -251,10 +252,21 @@ func RunPurchase(ctx context.Context, opts PurchaseOptions) error {
 	switch {
 	case useRegister:
 		created := 0
+		var itemErrs []string
 		for i, it := range info.Items {
+			uuid := fmt.Sprintf("%s-%d", info.InstanceCode, i+1)
 			if registerCodes[i] != "" && !opts.Force {
-				fmt.Printf("  = 明细 %d 的流水登记单已代建过（%s），跳过\n", i+1, short(registerCodes[i]))
-				continue
+				// 上一张还"活着"就跳过；上一张**退回失败**（例如审批节点是自动通过、
+				// 单子已经废了）→ 换 uuid 重建一张，并把旧留痕丢掉，否则永远补不回来。
+				if r, ok, _ := db.GetFlowRegister(ctx, registerCodes[i]); !ok || r.State != store.FlowRegisterFailed {
+					fmt.Printf("  = 明细 %d 的流水登记单已代建过（%s），跳过\n", i+1, short(registerCodes[i]))
+					continue
+				}
+				fmt.Printf("  ⟳ 明细 %d 上次的登记单 %s 没退回去 → 重建一张\n",
+					i+1, short(registerCodes[i]))
+				_ = db.DeleteFlowRegister(ctx, registerCodes[i])
+				registerCodes[i] = ""
+				uuid = fmt.Sprintf("%s-%d-r%d", info.InstanceCode, i+1, time.Now().Unix())
 			}
 			if opts.DryRun {
 				form, _ := buildFlowRegisterForm(cfg, info, it, info.FinishTimeMS)
@@ -263,19 +275,22 @@ func RunPurchase(ctx context.Context, opts PurchaseOptions) error {
 					i+1, cfg.RegisterUserID(), trunc(string(b), 320))
 				continue
 			}
-			code, err := createFlowRegisterDraft(ctx, cfg, client, registerAppr.Code,
-				info, it, i+1, info.FinishTimeMS)
-			if err != nil {
-				// 已建出来的登记单必须落本地，否则重跑会重复建（UUID 冲突）
+			// ★ 建单与退回分开看：只要**建出来了**（code 非空）就必须落本地 +
+			//   写「流水审批ID」，否则重跑会再建一张（UUID 冲突 60012）或让
+			//   覆盖时认不出这行（会把登记数据写成一张新行）。
+			code, derr := createFlowRegisterDraft(ctx, cfg, client, registerAppr.Code,
+				info, it, i+1, info.FinishTimeMS, uuid)
+			if code == "" {
+				itemErrs = append(itemErrs, fmt.Sprintf("明细 %d 建单失败: %v", i+1, derr))
 				_ = db.UpsertPurchase(ctx, store.PurchaseSync{
 					PurchaseInstanceCode: info.InstanceCode, ApprovalCode: info.ApprovalCode,
 					ApplicantUserID: info.ApplicantID, PurchaseStatus: status,
 					ProjectGroup: info.ProjectGroup, MirrorRecordID: mirrorID,
 					LedgerRecordIDs: ledgerIDs, RequestRecordIDs: requestIDs,
 					FlowRegisterCodes: registerCodes,
-					DraftState:        "failed", LastError: err.Error(),
+					DraftState:        "failed", LastError: derr.Error(),
 				})
-				return fmt.Errorf("代建流水登记单（明细 %d）失败: %w", i+1, err)
+				continue
 			}
 			registerCodes[i] = code
 			created++
@@ -289,14 +304,25 @@ func RunPurchase(ctx context.Context, opts PurchaseOptions) error {
 					}
 				}
 			}
+			state := store.FlowRegisterAwaiting
+			lastErr := ""
+			if derr != nil {
+				state, lastErr = store.FlowRegisterFailed, derr.Error()
+				itemErrs = append(itemErrs, fmt.Sprintf("明细 %d: %v", i+1, derr))
+			}
 			if err := db.UpsertFlowRegister(ctx, store.FlowRegisterSync{
 				InstanceCode:         code,
 				PurchaseInstanceCode: info.InstanceCode,
 				LedgerRecordID:       ledgerRecordIDAt(ledgerIDs, i),
 				ItemIndex:            i + 1,
-				State:                store.FlowRegisterAwaiting,
+				State:                state,
+				LastError:            lastErr,
 			}); err != nil {
 				fmt.Printf("  ⚠ 登记单本地留痕失败（不影响流程）: %v\n", err)
+			}
+			if derr != nil {
+				fmt.Printf("  ⚠ 流水登记单 %d = %s 建出来了，但退回失败: %v\n", i+1, short(code), derr)
+				continue
 			}
 			fmt.Printf("  ✓ 流水登记单 %d = %s（已退回发起，待 %s 提交）\n", i+1, short(code), cfg.RegisterUserID())
 		}
@@ -306,6 +332,18 @@ func RunPurchase(ctx context.Context, opts PurchaseOptions) error {
 				names = append(names, it.Name)
 			}
 			_ = notifyRegistrant(ctx, cfg, client, info, registerCodes, names)
+		}
+		if len(itemErrs) > 0 {
+			// 记状态再抛错：既有据可查，也让补漏扫描能重试（见 catchup.go）
+			_ = db.UpsertPurchase(ctx, store.PurchaseSync{
+				PurchaseInstanceCode: info.InstanceCode, ApprovalCode: info.ApprovalCode,
+				ApplicantUserID: info.ApplicantID, PurchaseStatus: status,
+				ProjectGroup: info.ProjectGroup, MirrorRecordID: mirrorID,
+				LedgerRecordIDs: ledgerIDs, RequestRecordIDs: requestIDs,
+				FlowRegisterCodes: registerCodes,
+				DraftState:        "failed", LastError: strings.Join(itemErrs, "; "),
+			})
+			return fmt.Errorf("流水登记单有 %d 项没成功: %s", len(itemErrs), strings.Join(itemErrs, "; "))
 		}
 	default:
 		if inv, ok := cfg.ApprovalByRole(config.RoleInvoiceCollect); ok && inv.Code != "" {

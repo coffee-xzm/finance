@@ -179,3 +179,16 @@ func TestLoadKeepsPurchaseToInvoiceDefaults(t *testing.T) {
 		t.Errorf("显式置空应覆盖默认值，实际 %q", got)
 	}
 }
+
+// TestPurchaseGroupOptionsComplete 项目组选项必须与线上表单**逐项对得上**：
+// 2026-09-21 实测漏了技术组四项，建实例直接报
+// 1390001「控件的值不存在单选框的选项中，请检查你的输入」。
+func TestPurchaseGroupOptionsComplete(t *testing.T) {
+	c := &Config{Dict: DefaultDict()}
+	for _, g := range []string{"重装组", "步兵组", "哨兵组", "无人机组", "飞镖组", "雷达组",
+		"硬件组", "机械组", "电控组", "视觉组"} {
+		if c.OptionValue(RolePurchase, "项目组", g) == "" {
+			t.Errorf("项目组选项缺 %s（会让创建采购实例失败）", g)
+		}
+	}
+}

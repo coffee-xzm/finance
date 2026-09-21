@@ -220,10 +220,14 @@ func DefaultDict() Dict {
 				"是否为支付宝付款": {"是": "mu0qbtq8-jdbrodratq8-0", "否": "mu0qbtq8-55q2zizlc3k-0"},
 			},
 			RolePurchase: {
+				// ★ 2026-09-21 按线上表单定义补全（原来只有 6 个组，缺技术组四项；
+				//   少了哪一项，创建实例就会报 1390001「控件的值不存在单选框的选项中」）。
 				"项目组": {
 					"重装组": "mu7u7m62-myow8r18b5-0", "步兵组": "mu7u7m62-gt80cdnl1bn-0",
 					"哨兵组": "mu7u7m62-715zsbh5xew-0", "无人机组": "mu7u7vid-6mpdp0gf78p-1",
 					"飞镖组": "mu7u7vid-w5ms6rfn3e-3", "雷达组": "mu7u7vid-mt3xd38m78-5",
+					"硬件组": "mu7u7vid-uqdynhhxao-7", "机械组": "mu7u7vid-p7bq3gddif-9",
+					"电控组": "mu7u7vid-7e8imaffzsu-11", "视觉组": "mu7u7vid-eqdp8iqnvmt-13",
 				},
 				"采购类别": {
 					"机械成品件": "l2hj0e3b-x7ckiyvutmb-0", "机械加工件": "l2hj0e3h-so9egdaof-1",

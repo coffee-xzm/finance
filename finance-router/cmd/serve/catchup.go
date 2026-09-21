@@ -105,8 +105,19 @@ func (s *service) catchUpSweep(ctx context.Context) {
 				if !approved {
 					continue
 				}
-				if _, ok, _ := s.db.GetPurchase(ctx, code); ok {
-					continue // 幂等锚点：处理过就别再碰
+				if prev, ok, _ := s.db.GetPurchase(ctx, code); ok {
+					// 幂等锚点：处理过就别再碰。**例外**：上次中途失败
+					// （draft_state=failed，例如流水登记单没退回去）要重试，
+					// 否则那笔采购的登记单永远补不上（2026-09-21 实测踩到）。
+					if prev.DraftState != "failed" {
+						continue
+					}
+					if !sweepFirstSeen(code) {
+						continue
+					}
+					fmt.Printf("  ⟳ 补漏：采购 %s 上次处理失败（%s）→ 重试\n",
+						short(code), truncateStr(prev.LastError, 60))
+					break
 				}
 				if !sweepFirstSeen(code) {
 					continue // 已入队过，等 worker 落库后由上面的锚点接管

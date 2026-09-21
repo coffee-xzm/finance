@@ -240,10 +240,11 @@ func buildFlowRegisterForm(cfg *config.Config, info *purchaseInfo, it purchaseIt
 
 // createFlowRegisterDraft 代建一张「27-流水登记」并退回到发起人。
 //
-// uuid 用 `<采购实例code>-<明细序号>`：同一明细重复处理会撞 60012（UUID 冲突），
-// 由调用方按"本地已记过就跳过"来避免。
+// uuid 由调用方给（正常是 `<采购实例code>-<明细序号>`）：同一明细重复处理会撞
+// 60012（UUID 冲突），所以"重跑到同一明细"必须换一个 uuid（见 RunPurchase 里的重建分支）。
 func createFlowRegisterDraft(ctx context.Context, cfg *config.Config, client *feishu.Client,
-	registerCode string, info *purchaseInfo, it purchaseItem, idx int, finishMS int64) (string, error) {
+	registerCode string, info *purchaseInfo, it purchaseItem, idx int, finishMS int64,
+	uuid string) (string, error) {
 
 	userID := cfg.RegisterUserID()
 	if userID == "" {
@@ -253,13 +254,22 @@ func createFlowRegisterDraft(ctx context.Context, cfg *config.Config, client *fe
 	for _, n := range notes {
 		fmt.Printf("  预填 %s\n", n)
 	}
-	newCode, err := client.CreateInstance(ctx, feishu.CreateInstanceRequest{
+	req := feishu.CreateInstanceRequest{
 		ApprovalCode:  registerCode,
 		UserID:        userID,
 		Form:          form,
-		UUID:          fmt.Sprintf("%s-%d", info.InstanceCode, idx),
+		UUID:          uuid,
 		AllowResubmit: true,
-	})
+	}
+	newCode, err := client.CreateInstance(ctx, req)
+	if err != nil && strings.Contains(err.Error(), "60012") {
+		// UUID 冲突 = 这个幂等键**已经被用过**（例如上一张单建出来了但没退回去，
+		// 本地换了 uuid 重建却撞上了历史键）。换一个带时间戳的 uuid 再试一次：
+		// 宁可多一张作废单，也不要让这笔采购永远补不回来。
+		req.UUID = fmt.Sprintf("%s-r%d", uuid, time.Now().Unix())
+		fmt.Printf("  ↻ uuid %s 已被占用（60012），改用 %s 重试\n", uuid, req.UUID)
+		newCode, err = client.CreateInstance(ctx, req)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -275,7 +285,14 @@ func createFlowRegisterDraft(ctx context.Context, cfg *config.Config, client *fe
 		}
 	}
 	if task == nil {
-		return newCode, fmt.Errorf("建单成功但没有 PENDING 任务可退回（需人工处理）")
+		// ★ 实测（2026-09-21）：「27-流水登记」的审批节点若配成**自动通过**，
+		//   建单后实例立刻 APPROVED（timeline 只有 START + AUTO_PASS），
+		//   既没有待办可退回（回退报 10112 no permission over task），
+		//   登记人也永远拿不到可编辑的表单 —— "先填再撤回"就落不了地。
+		//   正解：把该节点改成**真实审批人**（例如登记人本人），见 docs/33 §12.15。
+		return newCode, fmt.Errorf("建单成功但审批定义的这个节点是「自动通过」，"+
+			"没有可退回的待办任务（实例已 %s）→ 请把「27-流水登记」的审批节点改成真实审批人",
+			det.Status)
 	}
 	if err := client.SpecifiedRollback(ctx, task.UserID, task.ID, []string{"START"},
 		"请核对/补齐流水信息（转账日期、金额、截图、金额来源/去向）后提交"); err != nil {
@@ -361,6 +378,14 @@ func RunFlowRegister(ctx context.Context, opts FlowRegisterOptions) error {
 		if r.State == store.FlowRegisterApplied && !opts.Force {
 			fmt.Printf("  = 登记单 %s 已经覆盖过流水行（%s），跳过\n", short(opts.Instance), ledgerRecID)
 			return nil
+		}
+	}
+	if ledgerRecID == "" && purchaseCode != "" {
+		// 本地有映射但没记到行（例如退回失败时提前落的痕）→ 按明细序号对采购的流水行
+		if p, ok, _ := db.GetPurchase(ctx, purchaseCode); ok {
+			if it, ok2, _ := db.GetFlowRegister(ctx, opts.Instance); ok2 {
+				ledgerRecID = ledgerRecordIDAt(p.LedgerRecordIDs, it.ItemIndex-1)
+			}
 		}
 	}
 	if ledgerRecID == "" {

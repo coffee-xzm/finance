@@ -79,6 +79,12 @@ func (d *DB) SetFlowRegisterState(ctx context.Context, instanceCode, state, last
 	return err
 }
 
+// DeleteFlowRegister 丢掉一张登记单的留痕（用于"上一张没退回去、换 uuid 重建"）。
+func (d *DB) DeleteFlowRegister(ctx context.Context, instanceCode string) error {
+	_, err := d.sql.ExecContext(ctx, `DELETE FROM flow_register WHERE instance_code = ?`, instanceCode)
+	return err
+}
+
 // FlowRegistersOfPurchase 取某采购带出的全部登记单（按明细序号）。
 func (d *DB) FlowRegistersOfPurchase(ctx context.Context, purchaseInstanceCode string) ([]FlowRegisterSync, error) {
 	rows, err := d.sql.QueryContext(ctx, `
