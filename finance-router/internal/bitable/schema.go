@@ -180,3 +180,50 @@ func IntegratedTable() Table {
 
 // Slots 返回三个附件槽位的显示名。
 func Slots() []string { return slots }
+
+// PurchaseRequestTable 是「27采购申请表」（wiki）的目标结构（2026-09-19 用户要求）：
+// 采购审批通过后，把采购信息写进这张表，**字段对齐参考表 `tbllUFPS…`**。
+//
+// 参考表实测 20 个字段（名称/类型/选项逐字照抄）；其中：
+//   - 参考表的主字段是「申请编号」(Url)。目标表已有的主字段是文本「项目名称」，
+//     无法安全改成 URL 类型，所以这里用**「项目名称」当主字段**（同为文本、人更易读）。
+//   - 「商品图片」在参考表里是 Url；我们拿到的是审批附件的 24 小时临时直链，
+//     写进去第二天就点不开，所以在字段类型上改成**附件**（下载转存 → file_token）。
+//
+// ★ 2026-09-19 用户从表里删掉了 4 列，这里**同步删除**，否则
+// `purchase-request-init` 会把它们重建回来：
+// 当前处理人 / 审批节点 / 费用明细_规格 / 费用明细_金额-币种。
+// 现为 16 个字段（与线上一致）。
+func PurchaseRequestTable() Table {
+	f := []Field{
+		{Name: "项目名称", Type: TypeText, SourceOfTruth: "form"},
+		{Name: "申请编号", Type: TypeURL, SourceOfTruth: "feishu"},
+		{Name: "申请状态", Type: TypeSingleSelect,
+			Options:       []string{"审批中", "已通过", "已拒绝", "已取消", "已撤回", "已终止", "已删除"},
+			SourceOfTruth: "feishu"},
+		{Name: "审批流程", Type: TypeSingleSelect,
+			Options: []string{"流动资金采购审批", "采购审批 - 27Test"}, SourceOfTruth: "feishu"},
+		{Name: "发起时间", Type: TypeDate, DateFmt: "yyyy-MM-dd HH:mm", SourceOfTruth: "feishu"},
+		{Name: "完成时间", Type: TypeDate, DateFmt: "yyyy-MM-dd HH:mm", SourceOfTruth: "feishu"},
+		{Name: "发起人", Type: TypeUser, SourceOfTruth: "feishu"},
+		{Name: "发起人部门", Type: TypeText, SourceOfTruth: "feishu"},
+		{Name: "采购类别", Type: TypeSingleSelect,
+			Options: []string{"机械成品件", "机械加工件", "电控物资", "其他"}, SourceOfTruth: "form"},
+		{Name: "费用明细_名称", Type: TypeText, SourceOfTruth: "form"},
+		{Name: "费用明细_金额", Type: TypeNumber, Formatter: "0.00", SourceOfTruth: "form"},
+		{Name: "费用明细_数量", Type: TypeNumber, Formatter: "0.00", SourceOfTruth: "form"},
+		{Name: "商品图片", Type: TypeAttachment,
+			Note: "审批里的商品图片（临时直链 24h 失效）→ 转存为附件，长期有效", SourceOfTruth: "image"},
+		{Name: "采购事由", Type: TypeText, SourceOfTruth: "form"},
+		{Name: "期望交付时间", Type: TypeDate, DateFmt: "yyyy-MM-dd", SourceOfTruth: "form"},
+		{Name: "SourceID", Type: TypeText, Note: "对账/幂等键：写采购审批实例 code", SourceOfTruth: "local"},
+	}
+	return Table{
+		Key:       "purchase_request",
+		Name:      "27采购申请表",
+		Authority: "服务写（采购审批通过后）",
+		Description: "采购审批通过后写入；字段对齐参考表 tbllUFPS…。" +
+			"主字段为「项目名称」（参考表主字段是 URL 的「申请编号」，不便照搬）。",
+		Fields: f,
+	}
+}

@@ -23,7 +23,10 @@
 
 PROGRAMS=(
     "python3 /home/wdr/RoboWarehouse/run.py|$HOME/robo_logs/log1"
-    "/home/wdr/my-go-app/main_binary|$HOME/robo_logs/log2"
+    # ★ 2026-09-21 注释掉：/home/wdr/my-go-app/ 在这台机器上**不存在**（模板里的占位项）。
+    #   以前守护脚本不查存活，所以一直没人发现；加上存活检查后它会每 10 分钟
+    #   报一次"启动失败"，纯噪音。真要跑这个服务时再解开。
+    #"/home/wdr/my-go-app/main_binary|$HOME/robo_logs/log2"
     #"python /home/wdr/feishu_chat_bot/feishu_ai_bot.py|$HOME/robo_logs/log3"
     #"/home/wdr/github-commit-monitor/commit-monitor|$HOME/robo_logs/log4"
     "/home/wdr/bitable2docx/awesomeProject|$HOME/robo_logs/log5"
@@ -85,14 +88,82 @@ stop_programs() {
     done
 }
 
+# --- 存活检查（初始化与每轮循环共用）---
+#
+# ★ 2026-09-21 新增。原来那个循环**只做 07:00 的定时重启**：
+#   进程崩了（panic / OOM / 被误杀）要等最多 24 小时才会被拉起来，
+#   期间审批事件全部丢失（飞书长连接离线不补推）。
+#
+# 约定：配了停止命令（三段式）的条目，其启动命令必须是**幂等**的
+#   —— finance 的 `serve-ctl.sh start` 正是幂等的（在跑就不动，二进制变了才自动重启）。
+#   没配停止命令的条目仍按进程名判断，避免每 10 分钟拉起一个重复进程。
+#
+# 所以**开机初始化也用它**（而不是 start_programs）：手工重启守护脚本时
+# 不会把另外三个服务拉出重复副本。
+ensure_alive() {
+    for item in "${PROGRAMS[@]}"; do
+        parse_item "$item"
+        mkdir -p "$LOG_DIR" 2>/dev/null
+
+        if [ -n "$STOP_CMD" ]; then
+            local keep_log="$LOG_DIR/keepalive_$(date '+%Y%m%d').log"
+            if ! $START_CMD >>"$keep_log" 2>&1; then
+                echo "[$(date '+%H:%M:%S')] ⚠ 存活检查启动失败: $START_CMD（详见 $keep_log）"
+            fi
+            continue
+        fi
+
+        local proc_name
+        proc_name=$(basename "${START_CMD%% *}")
+        if pgrep -f "$proc_name" > /dev/null 2>&1; then
+            continue
+        fi
+        local log_file="$LOG_DIR/log_$(date '+%Y%m%d_%H%M%S').log"
+        nohup $START_CMD > "$log_file" 2>&1 &
+        echo "[$(date '+%H:%M:%S')] 存活检查: $proc_name 不在，已重新启动 -> $log_file"
+    done
+}
+
 # --- 初始化 ---
 # 等待网络
-while ! ping -c 1 -W 1 8.8.8.8 &> /dev/null; do sleep 2; done
+#
+# ★ 2026-09-21：加上超时上限。原来是无上限 `while ! ping 8.8.8.8; do sleep 2; done`
+#   —— 如果路由器/上行挂了（或 ICMP 被禁），脚本会**永远卡在这里**，
+#   连本地那三个不需要外网的服务也起不来。现在最多等 5 分钟就先起本地服务。
+wait_net() {
+    local waited=0
+    while ! ping -c 1 -W 1 8.8.8.8 &> /dev/null; do
+        waited=$((waited + 1))
+        if [ "$waited" -ge 150 ]; then
+            echo "[$(date '+%H:%M:%S')] ⚠ 等网络超过 5 分钟（外网不通？），先启动本地服务"
+            return 1
+        fi
+        sleep 2
+    done
+    return 0
+}
 
-start_programs
+wait_net
+
+# 幂等启动：开机时什么都没跑 → 全部拉起；手工重启守护脚本时 → 已在跑的不动。
+ensure_alive
 
 # --- 监控循环 ---
+#
+# ★ 先 sleep 再检查（原来是先检查后 sleep）：初始化那次 ensure_alive 已经把所有
+#   该起的都起了，若紧接着再检查一遍，遇到"启动慢半拍"的进程会被判成不在而**重复拉起**。
+#   先睡一小段可避免这个竞态。
+#
+# ★ 节拍 60 秒（原来 600 秒）：600 秒意味着进程崩掉后最长有 10 分钟无人处理，
+#   期间审批事件会丢（虽然重启后补漏扫描能补回来，但没必要留这么长的盲区）。
+#   ensure_alive 只是 stat pidfile / pgrep，60 秒一次的开销可以忽略；
+#   07:00 的定时重启另有"每天一次"标记保护，逐分钟判也只会真正执行一次。
+LIVENESS_INTERVAL="${LIVENESS_INTERVAL:-60}"
 while true; do
+    sleep "$LIVENESS_INTERVAL"
+
+    ensure_alive
+
     current_hour=$(date "+%H")
     today=$(date "+%Y%m%d")
 
@@ -104,5 +175,4 @@ while true; do
             start_programs
         fi
     fi
-    sleep 600
 done

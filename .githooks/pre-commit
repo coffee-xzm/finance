@@ -67,12 +67,19 @@ PATTERNS=(
     '(od-|ou_)[a-f0-9]{8,}'                            # 部门 / 用户 open id（含截断形式）
     '[a-z0-9]{10,12}\.feishu\.cn'                      # 租户域名
     '[A-Z0-9]{8}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{12}'  # 实例号 / 定义 code
-    '[0-9]{15,25}'                                     # 发票号等长数字
+    # 长数字：发票号等。★ 2026-09-21 加 (?<!widget) —— 飞书表单控件 id 形如
+    # widget17893053389170001（17 位），它是**功能必需**（dict 里靠它预填控件），
+    # 又不在 config.yml 里，所以不能用精确黑名单放行，只能在这里排除该前缀。
+    '(?<!widget)(?<![A-Za-z0-9_.-])[0-9]{15,25}(?![A-Za-z0-9_.-])'
 )
 
 # 测试夹具天然需要长数字/示例 UUID（且必须用假值）。所以**形态**正则跳过 _test.go，
 # 但**精确黑名单**（上面的 2a）对所有文件生效 —— 真值放进测试一样会被拦。
-added_nontest=$(echo "$added" | grep -v '_test\.go$' || true)
+# 合成夹具：插件侧"命名冻结向量"故意用假发票号（20 位数字），必须放行。
+# 这些值与 internal/naming 共用同一份向量，改数字会破坏两端一致性。
+added_nontest=$(echo "$added" | grep -v '_test\.go$' \
+                | grep -v '^bitable-plugin/testdata/' \
+                | grep -v '^bitable-plugin/src/core/cases\.ts$' || true)
 
 for pat in "${PATTERNS[@]}"; do
     bad=$(echo "$added_nontest" | xargs -r grep -nE -- "$pat" 2>/dev/null \

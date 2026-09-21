@@ -78,6 +78,8 @@ type job struct {
 	InstanceCode string
 	EventID      string
 	Status       string
+	// Role 是审批角色（invoice_collect / purchase），决定走哪条链路。
+	Role string
 }
 
 type service struct {
@@ -239,50 +241,55 @@ func main() {
 	// 租户里有多个审批定义（实测 4 个）。config 里 approval_code 填错不会有任何报错：
 	// 只会静默地收不到事件，或收到别的表单的数据。所以这里把 code 解析成**名字**打出来，
 	// 并在配置了 approval_name_expect 时做硬校验 —— 对不上直接拒绝启动（fail closed）。
-	if cfg.Feishu.ApprovalCode != "" {
-		def, derr := s.client.GetApprovalDefinition(ctx, cfg.Feishu.ApprovalCode)
-		switch {
-		case derr != nil:
-			fmt.Printf("审批定义  : %s\n", cfg.Feishu.ApprovalCode)
-			fmt.Printf("            ⚠ 解析名称失败: %v\n", derr)
-		default:
-			fmt.Printf("审批定义  : %s\n", def.ApprovalName)
-			fmt.Printf("            %s  [%s]\n", cfg.Feishu.ApprovalCode, def.Status)
-			if expect := cfg.Feishu.ApprovalNameExpect; expect != "" &&
-				!strings.Contains(def.ApprovalName, expect) {
-				fmt.Printf("\n✗ 拒绝启动：期望绑定名称含 %q，实际是 %q\n", expect, def.ApprovalName)
-				fmt.Println("  要么改 config.yml 的 approval_code，要么改 approval_name_expect。")
-				fmt.Println("  先看清有哪些表单：go run ./cmd/approvals")
-				os.Exit(1)
-			}
+	// ★ 角色化审批绑定（docs/30-review/33 §5.1）：invoice_collect + purchase。
+	// 旧配置只有单个 approval_code 时退化成"一个发票收集角色"。
+	// 这份列表同时被补漏扫描（catchup.go）使用，所以走同一个方法。
+	approvals := s.approvalRoles()
+	if len(approvals) == 0 {
+		fmt.Println("审批定义  : ⚠ 未配置 feishu.approvals / approval_code")
+	}
+	for _, a := range approvals {
+		def, derr := s.client.GetApprovalDefinition(ctx, a.Code)
+		if derr != nil {
+			fmt.Printf("审批定义  : [%s] %s\n            ⚠ 解析名称失败: %v\n", a.Role, a.Code, derr)
+			continue
 		}
-	} else {
-		fmt.Println("审批定义  : ⚠ 未配置 approval_code")
+		fmt.Printf("审批定义  : [%s] %s  (%s)\n", a.Role, def.ApprovalName, def.Status)
+		if a.NameExpect != "" && !strings.Contains(def.ApprovalName, a.NameExpect) {
+			fmt.Printf("\n✗ 拒绝启动：角色 %s 期望名称含 %q，实际是 %q\n", a.Role, a.NameExpect, def.ApprovalName)
+			fmt.Println("  改 config.yml 的 feishu.approvals，或先看有哪些表单：go run ./cmd/approvals")
+			os.Exit(1)
+		}
 	}
 	fmt.Printf("处理模式  : %v\n", map[bool]string{true: "dry-run（不处理）", false: "正常"}[*dryRun])
 
 	// 先订阅审批定义。**不调这一步，一条事件都收不到。**
 	if !*noSubscribe {
-		if cfg.Feishu.ApprovalCode == "" {
-			fmt.Println("⚠ 未配置 approval_code，跳过订阅")
-		} else if err := s.client.SubscribeApproval(ctx, cfg.Feishu.ApprovalCode); err != nil {
-			// `1390007 subscription existed` = 已订阅过，属正常，不是失败。
-			// （补了 approval:approval 后服务订过一次，或管理员在审批后台手工订过。）
-			if strings.Contains(err.Error(), "subscription existed") ||
-				strings.Contains(err.Error(), "1390007") {
-				fmt.Println("✓ 该审批定义已是订阅状态（subscription existed）")
-			} else {
+		if len(approvals) == 0 {
+			fmt.Println("⚠ 未配置审批定义，跳过订阅")
+		}
+		for _, a := range approvals {
+			err := s.client.SubscribeApproval(ctx, a.Code)
+			switch {
+			case err == nil:
+				fmt.Printf("✓ [%s] 已订阅该审批定义的实例事件\n", a.Role)
+			case strings.Contains(err.Error(), "subscription existed") ||
+				strings.Contains(err.Error(), "1390007"):
+				fmt.Printf("✓ [%s] 该审批定义已是订阅状态（subscription existed）\n", a.Role)
+			default:
 				// 其它失败不退出：可能只是缺 approval:approval 权限，
 				// 若管理员已在审批后台订阅过，事件仍会到达。
-				fmt.Printf("⚠ 订阅调用失败（若已在审批后台订阅过可忽略）: %v\n", err)
+				fmt.Printf("⚠ [%s] 订阅调用失败（若已在审批后台订阅过可忽略）: %v\n", a.Role, err)
 			}
-		} else {
-			fmt.Println("✓ 已订阅该审批定义的实例事件")
 		}
 	}
 
 	// 启动 worker（**单个**：串行处理，避免 manifest.jsonl 与飞书写入竞争）
 	go s.worker(ctx)
+
+	// ★ 补漏扫描（断网/断电/重启期间漏掉的事件不会补推，只能主动扫）：
+	//   启动时先扫一遍，此后每 10 分钟一次，把"该做还没做"的实例补进队列。
+	go s.catchUpLoop(ctx)
 
 	// 启动后台备份
 	//
@@ -418,8 +425,9 @@ func (s *service) handleInstanceFields(ctx context.Context, eventID, eventType,
 
 	s.received.Add(1)
 
-	// ① 只处理我们订阅的那张审批定义
-	if s.cfg.Feishu.ApprovalCode != "" && approvalCode != s.cfg.Feishu.ApprovalCode {
+	// ① 只处理配置里绑定的审批定义；按角色路由（发票收集 / 采购）
+	role := s.roleFor(approvalCode)
+	if role == "" {
 		s.ignored.Add(1)
 		fmt.Printf("  − 跳过其它审批定义 %s（实例 %s）\n", short(approvalCode), short(instance))
 		_, _, _ = s.db.RecordEvent(ctx, store.Event{
@@ -461,15 +469,35 @@ func (s *service) handleInstanceFields(ctx context.Context, eventID, eventType,
 		fmt.Printf("  ⊘ 状态未变: %s（实例 %s）\n", tr.Reason, short(instance))
 	}
 
-	// ④ 入队
-	select {
-	case s.queue <- job{InstanceCode: instance, EventID: eventID, Status: status}:
-	default:
-		s.failed.Add(1)
-		fmt.Printf("  ⚠ 队列已满，丢弃实例 %s（可手动补跑：go run ./cmd/extract -instance %s）\n",
-			short(instance), instance)
+	// ④ 入队（队列满则丢弃，交给下一轮补漏扫描重试 —— 见 catchup.go）
+	if !s.enqueue(job{InstanceCode: instance, EventID: eventID, Status: status, Role: role}) {
+		fmt.Printf("     （也可手动补跑：go run ./cmd/extract -instance %s）\n", instance)
 	}
 	return nil
+}
+
+// markEvent 回填事件处理结果。
+//
+// 补漏扫描（catchup.go）构造的任务没有 event_id（不是事件驱动的），
+// 空 id 直接跳过 —— 否则每个补漏任务都会刷一条"留痕失败"。
+func (s *service) markEvent(ctx context.Context, eventID string, r store.EventResult, detail string) {
+	if eventID == "" {
+		return
+	}
+	_ = s.db.UpdateEventResult(ctx, eventID, r, detail)
+}
+
+// roleFor 按 approval_code 找到配置里的角色；找不到返回空（=不是我们的审批）。
+func (s *service) roleFor(approvalCode string) string {
+	for _, a := range s.cfg.Feishu.Approvals {
+		if a.Code != "" && a.Code == approvalCode {
+			return a.Role
+		}
+	}
+	if s.cfg.Feishu.ApprovalCode != "" && approvalCode == s.cfg.Feishu.ApprovalCode {
+		return config.RoleInvoiceCollect
+	}
+	return ""
 }
 
 // backupLoop 启动时备份一次，此后每 backupEvery 一次。
@@ -516,7 +544,28 @@ func (s *service) worker(ctx context.Context) {
 // process 处理一个实例：已有数据就跳过，否则跑完整链路。
 func (s *service) process(ctx context.Context, j job) {
 	if s.dryRun {
-		fmt.Printf("  [dry-run] 将处理实例 %s\n", short(j.InstanceCode))
+		fmt.Printf("  [dry-run] 将处理实例 %s（role=%s）\n", short(j.InstanceCode), j.Role)
+		return
+	}
+
+	// ★ 采购链路：只在「已通过」时动手（写流水 + 代建发票单）
+	if j.Role == config.RolePurchase {
+		if !strings.EqualFold(j.Status, "APPROVED") {
+			fmt.Printf("  − 采购实例 %s 状态 %s，非已通过 → 不处理\n",
+				short(j.InstanceCode), store.StateWord(j.Status))
+			return
+		}
+		if err := pipeline.RunPurchase(ctx, pipeline.PurchaseOptions{
+			CfgPath: s.cfg.Path, Instance: j.InstanceCode,
+		}); err != nil {
+			s.failed.Add(1)
+			s.markEvent(ctx, j.EventID, store.EventError, err.Error())
+			fmt.Printf("  ✗ 采购处理失败: %v\n", err)
+			return
+		}
+		s.processed.Add(1)
+		s.markEvent(ctx, j.EventID, store.EventAccepted, "采购处理完成")
+		fmt.Printf("  ✓ 采购实例 %s 处理完成\n", short(j.InstanceCode))
 		return
 	}
 
@@ -545,15 +594,59 @@ func (s *service) process(ctx context.Context, j job) {
 		return
 	}
 
+	// 是否已抽取入库
+	hasSub := false
+	if e, err := s.db.HasSubmission(ctx, j.InstanceCode); err == nil {
+		hasSub = e
+	}
+	approved := strings.EqualFold(j.Status, "APPROVED") || store.StateWord(j.Status) == "已通过"
+
+	// ★ 审批「已通过」= 新状态机的终点（docs/30-review/33 §4）：
+	//   把该实例所有行标为「通过」并归档。**不再**在每次新审批时扫全表。
+	if approved {
+		if !hasSub {
+			// 少见但可能：只收到 APPROVED（漏了 PENDING）。先补齐抽取+落表。
+			if err := s.ingest(ctx, j); err != nil {
+				return
+			}
+		}
+		if err := pipeline.FinalizeApproved(ctx, s.cfg, j.InstanceCode); err != nil {
+			s.failed.Add(1)
+			fmt.Printf("  ⚠ 审批通过后的回写/归档失败: %v\n", err)
+			return
+		}
+		s.processed.Add(1)
+		s.markEvent(ctx, j.EventID, store.EventAccepted, "审批通过，已归档")
+		fmt.Printf("  ✓ 实例 %s 审批通过处理完成\n", short(j.InstanceCode))
+		return
+	}
+
 	// 已经处理过（本地库里有该实例）→ 不重复下载与识别
-	if exists, err := s.db.HasSubmission(ctx, j.InstanceCode); err == nil && exists {
+	if hasSub {
 		fmt.Printf("  = 实例 %s 已处理过，跳过\n", short(j.InstanceCode))
 		return
 	}
 
 	fmt.Printf("  ▶ 处理实例 %s（%s）…\n", short(j.InstanceCode), store.StateWord(j.Status))
+	if err := s.ingest(ctx, j); err != nil {
+		return
+	}
+	// 通知"有问题"的行（存疑/缺件）
+	if err := pipeline.RunNotify(pipeline.NotifyOptions{CfgPath: s.cfg.Path, MaxSend: 3}); err != nil {
+		fmt.Printf("  ⚠ 通知失败: %v\n", err)
+	}
+	// ★ 全部行一致 → 服务自动同意审批；任一行有问题 → 什么都不做，等人处理
+	if err := pipeline.AutoApproveIfClean(ctx, s.cfg, j.InstanceCode); err != nil {
+		fmt.Printf("  ⚠ 自动同意审批失败: %v\n", err)
+	}
 
-	// ① 抽取（下载 → 转PNG → 识别 → 本地入库）
+	s.processed.Add(1)
+	s.markEvent(ctx, j.EventID, store.EventAccepted, "处理完成")
+	fmt.Printf("  ✓ 实例 %s 处理完成\n", short(j.InstanceCode))
+}
+
+// ingest 抽取 + 落表（不归档、不决定审批）。失败时记 failed。
+func (s *service) ingest(ctx context.Context, j job) error {
 	if err := pipeline.Run(pipeline.Options{
 		CfgPath:  s.cfg.Path,
 		Instance: j.InstanceCode,
@@ -562,12 +655,10 @@ func (s *service) process(ctx context.Context, j job) {
 		Quiet:    true,
 	}); err != nil {
 		s.failed.Add(1)
-		_ = s.db.UpdateEventResult(ctx, j.EventID, store.EventError, err.Error())
+		s.markEvent(ctx, j.EventID, store.EventError, err.Error())
 		fmt.Printf("  ✗ 抽取失败: %v\n", err)
-		return
+		return err
 	}
-
-	// ② 落到多维表格
 	if err := pipeline.RunSync(pipeline.SyncOptions{
 		CfgPath: s.cfg.Path,
 		Only:    j.InstanceCode,
@@ -576,22 +667,7 @@ func (s *service) process(ctx context.Context, j job) {
 		s.failed.Add(1)
 		fmt.Printf("  ⚠ 落表失败（本地已入库，可稍后重跑 sync）: %v\n", err)
 	}
-
-	// ③ 只有出错的行才需要人：一致的已自动「通过」，归档掉
-	if s.cfg.Review.AutoPass() {
-		if err := pipeline.RunArchive(pipeline.ArchiveOptions{CfgPath: s.cfg.Path}); err != nil {
-			fmt.Printf("  ⚠ 归档失败: %v\n", err)
-		}
-	}
-
-	// ④ 通知"待审"的行（出错的那部分）
-	if err := pipeline.RunNotify(pipeline.NotifyOptions{CfgPath: s.cfg.Path, MaxSend: 3}); err != nil {
-		fmt.Printf("  ⚠ 通知失败: %v\n", err)
-	}
-
-	s.processed.Add(1)
-	_ = s.db.UpdateEventResult(ctx, j.EventID, store.EventAccepted, "处理完成")
-	fmt.Printf("  ✓ 实例 %s 处理完成\n", short(j.InstanceCode))
+	return nil
 }
 
 // handleOtherEvent 收下"我们不参与处理"的事件：留痕后返回 nil。

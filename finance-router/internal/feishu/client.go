@@ -551,18 +551,36 @@ type InstanceDetail struct {
 	Status       string         `json:"status"`
 	StartTime    string         `json:"start_time"`
 	EndTime      string         `json:"end_time"`
-	Form         string         `json:"form"` // JSON 字符串
+	UserID       string         `json:"user_id"`  // 提交人 user_id
+	OpenID       string         `json:"open_id"`  // 提交人 open_id（写"人员"字段要用）
+	Reverted     bool           `json:"reverted"` // 是否处于"被退回待重提"状态
+	Form         string         `json:"form"`     // JSON 字符串
 	Timeline     []TimelineItem `json:"timeline"`
 	TaskList     []TaskItem     `json:"task_list"`
 }
 
+// TimelineItem 是审批实例时间线上的一条（START / PASS / …）。
+// 退回要的 task_def_key_list = 这里 type==PASS 的 node_key（外加 "START"）。
 type TimelineItem struct {
-	Type   string `json:"type"`
-	Status string `json:"status"`
+	Type       string `json:"type"`
+	Status     string `json:"status"`
+	NodeKey    string `json:"node_key"`
+	TaskID     string `json:"task_id"`
+	UserID     string `json:"user_id"`
+	OpenID     string `json:"open_id"`
+	CreateTime string `json:"create_time"`
 }
 
+// TaskItem 是审批实例当前节点上的一个审批任务。
+// 同意/退回需要 PENDING 任务里的 id + user_id。
 type TaskItem struct {
-	Status string `json:"status"`
+	Status   string `json:"status"`
+	ID       string `json:"id"`
+	NodeID   string `json:"node_id"`
+	NodeName string `json:"node_name"`
+	UserID   string `json:"user_id"`
+	OpenID   string `json:"open_id"`
+	Type     string `json:"type"`
 }
 
 func (c *Client) GetInstanceDetail(ctx context.Context, instanceCode string) (*InstanceDetail, json.RawMessage, error) {
@@ -850,7 +868,11 @@ func (c *Client) CreateWikiNode(ctx context.Context, spaceID, objType, title str
 // ── 多维表格字段写入（★ 写操作，仅在明确授权时使用）──────────────
 //
 // 权限：base:field:create / base:field:update 或 bitable:app（非只读）。
-// 新增字段仅接受 name/type/property 等；**不能设置公式表达式**（官方限制）。
+//
+// ★ 实测更正（2026-09-19）：新增字段**可以**带公式表达式 ——
+// CreateBitableField(type=20, property.formula_expression=…) 一次成功；
+// UpdateBitableField 改公式表达式同样有效（docs/30-review/33 §12.9）。
+// 公式**不能引用自己所在的列**（会成环 → 整列空白），编排公式时要避开。
 
 // FieldSpec 是新增/更新字段的请求体。
 type FieldSpec struct {
@@ -1321,8 +1343,7 @@ func (c *Client) GetUserName(ctx context.Context, userID string) (string, error)
 }
 
 // GetDepartmentName 是 GetDepartment 的便捷包装，只取名称。
-func (c *Client) GetDepartmentName(ctx context.Context, departmentID string) (string, error) {
-	info, err := c.GetDepartment(ctx, departmentID)
+func (c *Client) GetDepartmentName(ctx context.Context, departmentID string) (string, error) {	info, err := c.GetDepartment(ctx, departmentID)
 	if err != nil {
 		return "", err
 	}
@@ -1361,4 +1382,209 @@ func (c *Client) approvalSubscribeAction(ctx context.Context, approvalCode, acti
 	_, err := c.post(ctx,
 		"/approval/v4/approvals/"+url.PathEscape(approvalCode)+"/"+action, map[string]any{})
 	return err
+}
+
+// ── 审批实例：创建 / 同意 / 退回（★ 写操作）──────────────────────
+//
+// 用户 2026-09-19 需求逼出来的三件事（见 docs/30-review/33）：
+//   1. 采购通过后**代建** 27发票收集实例（提交人=采购提交人）→ CreateInstance；
+//   2. 校验没问题**自动同意审批** → ApproveTask；
+//   3. 代建后**退回到发起人**让他补材料再提交 → SpecifiedRollback。
+//
+// 权限：approval:instance（创建）/ approval:task（同意、退回）。
+// ★ user_id / task_id 走 `user_id_type=user_id`（本租户内一致，跨应用通用）。
+
+// CreateInstanceRequest 是"创建审批实例"的入参。
+type CreateInstanceRequest struct {
+	ApprovalCode string
+	UserID       string // 提交人 user_id
+	DepartmentID string // 可空；提交人属于多部门时建议填
+	Form         []map[string]any
+	UUID         string // 幂等键（同一 uuid 只能建一次，冲突 60012）
+	AllowResubmit bool  // 被退回后允许提交人在同一实例内重新提交
+}
+
+// CreateInstance 创建并提交一条审批实例，返回 instance_code。
+func (c *Client) CreateInstance(ctx context.Context, req CreateInstanceRequest) (string, error) {
+	formBytes, err := json.Marshal(req.Form)
+	if err != nil {
+		return "", fmt.Errorf("序列化 form: %w", err)
+	}
+	body := map[string]any{
+		"approval_code": req.ApprovalCode,
+		"user_id":       req.UserID,
+		"form":          string(formBytes),
+	}
+	if req.DepartmentID != "" {
+		body["department_id"] = req.DepartmentID
+	}
+	if req.UUID != "" {
+		body["uuid"] = req.UUID
+	}
+	if req.AllowResubmit {
+		body["allow_resubmit"] = true
+	}
+	data, err := c.post(ctx, "/approval/v4/instances", body)
+	if err != nil {
+		return "", err
+	}
+	var d struct {
+		InstanceCode string `json:"instance_code"`
+	}
+	if err := json.Unmarshal(data, &d); err != nil {
+		return "", fmt.Errorf("解析创建实例响应: %w", err)
+	}
+	if d.InstanceCode == "" {
+		return "", fmt.Errorf("创建实例成功但没返回 instance_code: %s", truncate(data, 200))
+	}
+	return d.InstanceCode, nil
+}
+
+// ApproveTask 同意一个审批任务（扮演该任务的审批人 user_id）。
+func (c *Client) ApproveTask(ctx context.Context, approvalCode, instanceCode, userID, taskID, comment string) error {
+	body := map[string]any{
+		"approval_code": approvalCode,
+		"instance_code": instanceCode,
+		"user_id":       userID,
+		"task_id":       taskID,
+	}
+	if comment != "" {
+		body["comment"] = comment
+	}
+	_, err := c.post(ctx, "/approval/v4/tasks/approve?user_id_type=user_id", body)
+	return err
+}
+
+// SpecifiedRollback 把实例退回到指定的已通过节点（taskDefKeyList 含 "START" 即退回发起人）。
+func (c *Client) SpecifiedRollback(ctx context.Context, userID, taskID string, taskDefKeyList []string, reason string) error {
+	body := map[string]any{
+		"user_id":           userID,
+		"task_id":           taskID,
+		"task_def_key_list": taskDefKeyList,
+	}
+	if reason != "" {
+		body["reason"] = reason
+	}
+	_, err := c.post(ctx, "/approval/v4/instances/specified_rollback?user_id_type=user_id", body)
+	return err
+}
+
+// ── 通讯录：部门名 → open_department_id ────────────────────────
+//
+// 用途：把采购「项目组」映射成 27发票收集 的「物资所属部门」（department 控件，
+// 值必须是 open_department_id）。实测该控件值形如
+// [{"name":"视觉组","open_id":"od-a04…"}]（真实 id 属租户数据，此处截断）。
+// 权限：contact:department.base:readonly（name 是字段级权限，缺了就查不到名字）。
+
+// DeptItem 是通讯录里的一个部门（只取需要的字段）。
+type DeptItem struct {
+	Name             string `json:"name"`
+	OpenDepartmentID string `json:"open_department_id"`
+	DepartmentID     string `json:"department_id"`
+}
+
+// ListDepartments 列出某个父部门下的直属子部门（parentOpenID 传 "0" 为根）。
+func (c *Client) ListDepartments(ctx context.Context, parentOpenID string) ([]DeptItem, error) {
+	if parentOpenID == "" {
+		parentOpenID = "0"
+	}
+	var all []DeptItem
+	pageToken := ""
+	for page := 0; page < 20; page++ {
+		q := url.Values{}
+		q.Set("parent_department_id", parentOpenID)
+		q.Set("department_id_type", "open_department_id")
+		q.Set("page_size", "50")
+		if pageToken != "" {
+			q.Set("page_token", pageToken)
+		}
+		data, err := c.get(ctx, "/contact/v3/departments", q)
+		if err != nil {
+			return all, err
+		}
+		var d struct {
+			Items     []DeptItem `json:"items"`
+			PageToken string     `json:"page_token"`
+			HasMore   bool       `json:"has_more"`
+		}
+		if err := json.Unmarshal(data, &d); err != nil {
+			return all, fmt.Errorf("解析部门列表: %w", err)
+		}
+		all = append(all, d.Items...)
+		if !d.HasMore || d.PageToken == "" {
+			break
+		}
+		pageToken = d.PageToken
+	}
+	return all, nil
+}
+
+// FindDepartmentByName 从根部门开始 BFS 找同名部门，返回第一个。
+// 最多下探 6 层，避免异常数据导致无限循环。
+func (c *Client) FindDepartmentByName(ctx context.Context, name string) (*DeptItem, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, fmt.Errorf("部门名为空")
+	}
+	queue := []string{"0"}
+	seen := map[string]bool{"0": true}
+	var lastErr error
+	for depth := 0; depth < 6 && len(queue) > 0; depth++ {
+		var next []string
+		for _, parent := range queue {
+			items, err := c.ListDepartments(ctx, parent)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			for i := range items {
+				if items[i].Name == name {
+					return &items[i], nil
+				}
+				if id := items[i].OpenDepartmentID; id != "" && !seen[id] {
+					seen[id] = true
+					next = append(next, id)
+				}
+			}
+		}
+		queue = next
+	}
+	if lastErr != nil {
+		return nil, fmt.Errorf("查部门 %q 失败: %w", name, lastErr)
+	}
+	return nil, fmt.Errorf("未找到名为 %q 的部门", name)
+}
+
+// ── 云文档协作者（只读）────────────────────────────────────────
+//
+// 用途：写多维表格被拒（403 / 91403）时，把"本应用在这个文档里到底是什么角色"
+// 直接查出来 —— 实测最常见的坑是**把应用加成了「可阅读」而不是「可编辑」**。
+// 权限：drive:drive 或 drive:permission（只读列举）。
+
+// PermissionMember 是文档协作者列表里的一项。
+type PermissionMember struct {
+	MemberID   string `json:"member_id"` // openid / openchat / appid / …
+	MemberType string `json:"member_type"`
+	Perm       string `json:"perm"` // view | edit | full_access | …
+	PermType   string `json:"perm_type"`
+}
+
+// ListPermissionMembers 列举某云文档的协作者（objType 空则按 bitable）。
+func (c *Client) ListPermissionMembers(ctx context.Context, token, objType string) ([]PermissionMember, error) {
+	if objType == "" {
+		objType = "bitable"
+	}
+	q := url.Values{}
+	q.Set("type", objType)
+	data, err := c.get(ctx, "/drive/v1/permissions/"+url.PathEscape(token)+"/members", q)
+	if err != nil {
+		return nil, err
+	}
+	var d struct {
+		Items []PermissionMember `json:"items"`
+	}
+	if err := json.Unmarshal(data, &d); err != nil {
+		return nil, fmt.Errorf("解析协作者列表: %w", err)
+	}
+	return d.Items, nil
 }

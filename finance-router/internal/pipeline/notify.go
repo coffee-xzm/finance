@@ -42,10 +42,16 @@ func RunNotify(opts NotifyOptions) error {
 	if err != nil {
 		return err
 	}
-	appToken := cfg.Feishu.Bitable.AppToken
-	tableID := cfg.Feishu.Bitable.Tables["submission"]
+	base, _ := cfg.Base(config.BaseReview)
+	appToken := base.AppToken
+	tableID := cfg.Table(config.BaseReview, "review")
 	if appToken == "" || tableID == "" {
-		return fmt.Errorf("配置缺少 bitable.app_token / tables.submission")
+		// 兼容旧配置
+		appToken = cfg.Feishu.Bitable.AppToken
+		tableID = cfg.Feishu.Bitable.Tables["submission"]
+	}
+	if appToken == "" || tableID == "" {
+		return fmt.Errorf("配置缺少核对表 base/table")
 	}
 
 	recip := notify.Recipient{OpenID: cfg.Feishu.AdminOpenID, UserID: cfg.Feishu.AdminUserID}
@@ -55,13 +61,14 @@ func RunNotify(opts NotifyOptions) error {
 	defer cancel()
 	client := feishu.NewClient(cfg.Feishu.BaseURL, cfg.Feishu.AppID, cfg.Feishu.AppSecret)
 
-	// 筛出需要人工的行（处理状态 = NEEDS_MANUAL / ERROR），且未被通知过
-	// 新表用「核对结果」表达是否需要人工（一致 / 存疑 / 缺件）。
+	// 筛出需要人工的行：核对结果 = 存疑 / 缺件，且未被通知过。
+	// 字段名与状态字面量都来自 config 字典（docs/30-review/33 §3）。
+	verdict := cfg.Field(config.BaseReview, "verdict")
 	filter := map[string]any{
 		"conjunction": "or",
 		"conditions": []map[string]any{
-			{"field_name": "核对结果", "operator": "is", "value": []string{"存疑"}},
-			{"field_name": "核对结果", "operator": "is", "value": []string{"缺件"}},
+			{"field_name": verdict, "operator": "is", "value": []string{"存疑"}},
+			{"field_name": verdict, "operator": "is", "value": []string{"缺件"}},
 		},
 	}
 	recs, err := client.SearchBitableRecords(ctx, appToken, tableID, filter, 200)
@@ -69,10 +76,11 @@ func RunNotify(opts NotifyOptions) error {
 		return fmt.Errorf("筛选待通知记录失败: %w", err)
 	}
 
+	explainField := cfg.Field(config.BaseReview, "explain")
 	var targets []*feishu.BitableRecord
 	skipped := 0
 	for i := range recs {
-		note := textOf(recs[i].Fields["差异说明"])
+		note := textOf(recs[i].Fields[explainField])
 		if strings.Contains(note, notifiedMark) {
 			skipped++
 			continue
@@ -96,7 +104,7 @@ func RunNotify(opts NotifyOptions) error {
 	sender := &notify.Sender{Client: client, Recipient: recip}
 	var sent, failed int
 	for _, r := range targets {
-		amtYuan := floatOf(r.Fields["图读金额(元)"])
+		amtYuan := floatOf(r.Fields[cfg.Field(config.BaseReview, "amount")])
 		var amtCent *int64
 		if amtYuan != 0 {
 			c := int64(amtYuan*100 + 0.5)
@@ -105,11 +113,13 @@ func RunNotify(opts NotifyOptions) error {
 		// 私信标题用「发票号码 + 销方名称」——「物资名称」那一列已经不在表里了
 		//（新表单没有这个控件），用一张票的身份信息反而更好认。
 		n := notify.NeedManual{
-			InstanceCode: textOf(r.Fields["审批实例号"]),
-			Slot:         joinNonEmpty(textOf(r.Fields["销方名称"]), textOf(r.Fields["发票号码"])),
-			Reason:       textOf(r.Fields["差异说明"]),
-			Verdict:      textOf(r.Fields["核对结果"]),
-			AmountCent:   amtCent,
+			InstanceCode: textOf(r.Fields[cfg.Field(config.BaseReview, "instance_no")]),
+			Slot: joinNonEmpty(
+				textOf(r.Fields[cfg.Field(config.BaseReview, "seller")]),
+				textOf(r.Fields[cfg.Field(config.BaseReview, "invoice_no")])),
+			Reason:     textOf(r.Fields[explainField]),
+			Verdict:    textOf(r.Fields[verdict]),
+			AmountCent: amtCent,
 		}
 		if dryRun {
 			fmt.Printf("  → %s / %s  原因=%s\n", short(n.InstanceCode), n.Slot, trunc(n.Reason, 40))
@@ -129,7 +139,7 @@ func RunNotify(opts NotifyOptions) error {
 		}
 		newNote += notifiedMark
 		if err := client.UpdateBitableRecord(ctx, appToken, tableID, r.RecordID,
-			map[string]any{"差异说明": newNote}); err != nil {
+			map[string]any{explainField: newNote}); err != nil {
 			fmt.Printf("  ⚠ %s 已通知但标记失败（下次会重复通知）: %v\n", short(n.InstanceCode), err)
 		}
 		sent++

@@ -25,6 +25,35 @@ type Config struct {
 	Matching     Matching          `yaml:"matching"`
 	Notify       Notify            `yaml:"notify"`
 	Paths        Paths             `yaml:"paths"`
+	Export       Export            `yaml:"export"`
+	// Dict 是静态配置字典（字段名/控件 id/选项/rules…）。用 inline 展开到顶层，
+	// 于是 config.yml 里可以直接写 approvals: / fields: / options: / rules: 等。
+	// 见 dict.go。
+	Dict Dict `yaml:",inline"`
+}
+
+// Export 是「选择性下载」的落盘配置（见 docs/30-review/32 §5.4）。
+type Export struct {
+	// Root 是本机产物根目录；留空 = data/export。
+	Root string `yaml:"root"`
+	// NASRoot 是 NAS 挂载点；留空 = 不复制。
+	NASRoot string `yaml:"nas_root"`
+	// Zip 控制是否额外产出 <out>.zip（默认 true）。
+	Zip *bool `yaml:"zip"`
+	// Naming 是命名模板；留空 = 内置默认（与插件侧共用同一份向量）。
+	Naming string `yaml:"naming"`
+	// GroupBy: department | month | none；留空 = department。
+	GroupBy string `yaml:"group_by"`
+	// MaxFilesPerBatch 单批文件数上限，防止一次把爆发期全拖下来。
+	MaxFilesPerBatch int `yaml:"max_files_per_batch"`
+}
+
+// ZipEnabled 返回是否打 zip（默认 true）。
+func (e Export) ZipEnabled() bool {
+	if e.Zip == nil {
+		return true
+	}
+	return *e.Zip
 }
 
 // PDF 去化配置。Qwen3-VL 不支持 PDF 输入，必须在本地光栅化为 PNG。
@@ -58,11 +87,17 @@ type Feishu struct {
 	BaseURL       string    `yaml:"base_url"`
 	Bitable       Bitable   `yaml:"bitable"`
 	Subscribe     Subscribe `yaml:"subscribe"`
+	// Approvals 是角色化的审批定义绑定（role → code + 期望名称）。
+	// 旧的单个 approval_code 仍兼容（见 ApprovalByRole）。
+	Approvals []ApprovalRole `yaml:"approvals"`
 }
 
 type Bitable struct {
 	AppToken string            `yaml:"app_token"`
 	Tables   map[string]string `yaml:"tables"`
+	// Bases 是多文档结构：base 名（review/flow）→ app_token + tables。
+	// 旧配置只有单个 app_token 时，视为 review base（见 Base()）。
+	Bases map[string]BaseConfig `yaml:"bases"`
 }
 
 type Subscribe struct {
@@ -127,7 +162,7 @@ func Load(path string) (*Config, error) {
 	if len(b) == 0 {
 		return nil, fmt.Errorf("配置 %s 是空文件 —— 请复制 config.example.yml 并填入真实值", path)
 	}
-	var c Config
+	var c = Config{Dict: DefaultDict()}
 	if err := yaml.Unmarshal(b, &c); err != nil {
 		return nil, fmt.Errorf("解析配置 %s: %w", path, err)
 	}
@@ -150,6 +185,15 @@ func Load(path string) (*Config, error) {
 		c.PDF.TmpDir = "data/tmp"
 	}
 	c.Path = path
+	if c.Export.Root == "" {
+		c.Export.Root = "data/export"
+	}
+	if c.Export.GroupBy == "" {
+		c.Export.GroupBy = "department"
+	}
+	if c.Export.MaxFilesPerBatch == 0 {
+		c.Export.MaxFilesPerBatch = 2000
+	}
 	if c.DetailByKind == nil {
 		c.DetailByKind = map[string]string{
 			"invoice": "high",

@@ -45,12 +45,12 @@
 
 ## 2. 一个我差点搞错的地方 ★
 
-批量替换时，我把 `cli_9cb844403dbb9108` 也替换成了占位符 —— **这是错的**。
+批量替换时，我把 `cli_9cb84440…` 也替换成了占位符 —— **这是错的**。
 
 查飞书官方文档确认（[打开飞书审批](https://open.feishu.cn/document/applink-protocol/supported-protocol/open-an-approval-page)）：
 
-> appId｜审批的应用 ID。其中**飞书品牌下审批的应用 ID 为 `cli_9cb844403dbb9108`**，
-> Lark 品牌下审批的应用 ID 为 `cli_9c7cc8a9a9edd105`。
+> appId｜审批的应用 ID。其中**飞书品牌下审批的应用 ID 为 `cli_9cb84440…`**，
+> Lark 品牌下审批的应用 ID 为 `cli_9c7cc8a9…`。
 
 它是**平台公开常量**，所有租户都一样，不是本项目的 app_id。而且它是拼 applink 必需的 ——
 替换掉会让写进多维表格的所有「申请编号」链接变成
@@ -219,7 +219,7 @@ HEAD 现在位于 b696f50
 - **GitHub 可能仍缓存旧对象**。force push 后，旧提交通常不再可达，但
   GitHub 不保证立即物理删除，且若有人在此之前 fork/clone 过则无法追回。
   考虑到泄露的只是标识符（无密钥），风险可接受；若要绝对干净，只能**删库重建**。
-- **Lark 品牌**用户需在 config 里设 `feishu.approval_app_id: cli_9c7cc8a9a9edd105`，
+- **Lark 品牌**用户需在 config 里设 `feishu.approval_app_id: cli_9c7cc8a9…`，
   否则 applink 指向飞书品牌的审批小程序。
 - 机器人上 `/tmp/finance-push.bundle` 用完即删（脚本里已处理）。
 - 机器人仍可能因为外网不稳而无法 `git pull`；日常部署建议直接用 `push-to-robot.sh`。

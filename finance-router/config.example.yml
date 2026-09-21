@@ -26,6 +26,17 @@ feishu:
   #   先跑 `go run ./cmd/approvals` 看清租户里有哪些表单。
   approval_name_expect: ""
 
+  # ── 角色化审批绑定（docs/30-review/33 §5.1）──────────────────
+  # 服务按 role 路由事件：invoice_collect=发票收集；purchase=采购审批。
+  # 配了 approvals 后优先用它；只配 approval_code 时视为单个 invoice_collect（兼容）。
+  approvals:
+    - role: invoice_collect
+      code: ""                 # 27发票收集
+      name_expect: ""          # 例如 "27发票收集"
+    - role: purchase
+      code: ""                 # 采购审批-27Test
+      name_expect: ""          # 例如 "采购审批 - 27Test"
+
   # 拼审批 applink 用的飞书审批小程序 appId。
   # 留空 = 用内置平台默认值（该值所有租户相同，不是本项目的 app_id）。一般不用改。
   approval_app_id: ""
@@ -54,6 +65,19 @@ feishu:
       evidence: ""            # 识别证据    ← 一行 = 一张图
       invoice_dedup: ""       # 发票唯一性  ← 本地唯一约束的镜像
       pipeline_log: ""        # 处理日志    ← 事件幂等与状态机验证
+    # ── 多文档结构（新；配了这个就优先用它）──────────────────
+    # review = 报销核对 + 报销整合；flow = 收支表 + 采购审批镜像表。
+    bases:
+      review:
+        app_token: ""
+        tables: { review: "tbl…", integrated: "tbl…" }
+      flow:
+        app_token: ""
+        tables: { ledger: "tbl…", purchase: "tbl…" }
+      # 采购审批通过后写入的「27采购申请表」（wiki）；字段对齐 flow.purchase 那张参考表
+      purchase_request:
+        app_token: ""
+        tables: { request: "tbl…" }
   subscribe:                      # 并行期【不要】订阅现有定义，保持物理隔离
     # ⚠ 订阅接口需要 approval:approval 或 approval:definition 权限；
     #   approval:approval:readonly 【不够】调 subscribe。
@@ -115,3 +139,55 @@ paths:
   db: "data/finance.db"
   backup_dir: "backup"
   backup_keep: 14
+
+# ── 选择性下载 / 导出（见 docs/30-review/32 §5.4）────────────────
+# 对应命令：cmd/export（清单/视图导出）、cmd/download-probe（P0 门禁探测）。
+# 整节可省略：省略时用代码内默认值（下面注释即默认值）。
+export:
+  root: "data/export"           # 本机产物根；cmd/export 的 -out 留空时用 <root>/YYYY-MM
+  nas_root: ""                  # NAS 挂载点；留空 = 不复制（zip 留在本机）
+  zip: true                     # 是否额外产出 <out>.zip
+  naming: ""                    # 命名模板；留空 = 内置默认（与插件侧同一份冻结向量）
+  group_by: "department"        # department | month | none
+  max_files_per_batch: 2000     # 单批文件数上限，防止一次把爆发期全拖下来
+
+# ══════════════════════════════════════════════════════════════
+# 静态配置字典（docs/30-review/33 §3）
+# 代码内置了与当前线上结构一致的默认值；这一节写的是**覆盖**。
+# 字段名必须与线上表头逐字一致（含 emoji、全角括号、空格）。
+# ══════════════════════════════════════════════════════════════
+
+# 部门名 → open_department_id（把采购「项目组」预填进发票审批的部门控件）。
+# 补 contact:department.base:readonly 后可从通讯录自动解析；否则在此手工补全。
+dept_map: {}
+
+# 业务规则
+rules:
+  tech_groups: [硬件组, 机械组, 电控组, 视觉组]   # ∈ 此集合 → 技术组物资
+  subject_tech: "技术组物资"
+  subject_project: "项目组物资"
+  dept_alias: { 工程组: 重装组, 英雄组: 重装组 }
+  review_pass: "通过"
+  review_fail: "驳回"
+  invoice_progress_options: [待办, 已通过]
+  invoice_progress_todo: "待办"
+  invoice_progress_done: "已通过"
+
+# 写表策略：只填空单元格；服务自有状态列例外（允许覆盖）
+write_policy:
+  only_fill_blank: true
+  service_owned: ["人工审核", "已归档", "审核时间", "发票收集进度（待配置）"]
+
+# 触发开关
+triggers:
+  archive_on_approval_approved: true   # 审批通过 → 归档（不再每次新审批扫全表）
+  auto_approve_when_clean: true        # 全部行无问题 → 自动同意审批
+
+# 采购 → 发票收集 的落地方式：创建后退回 START，由发起人补充后重提
+purchase_to_invoice:
+  draft_mode: rollback_to_start
+  # 代建发票单时写进「名称（选填，采购提示）」的值 = <采购审批的项目名称> + 此后缀。
+  # 例：项目名称「测试」→ 名称「测试-采购审批」。后缀是给收票人看的来源注释；
+  # 置空串（name_suffix: ""）= 只填项目名称、不加后缀。
+  name_suffix: "-采购审批"
+

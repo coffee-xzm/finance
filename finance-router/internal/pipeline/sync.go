@@ -36,7 +36,14 @@ import (
 )
 
 // 人改的字段：更新时**绝不覆盖**。
-var humanFields = []string{"人工审核", "审核备注", "已归档"}
+// humanFields 是人改的字段：更新时绝不覆盖（字段名来自 config 字典）。
+func humanFields(cfg *config.Config) []string {
+	return []string{
+		cfg.Field(config.BaseReview, "human_review"),
+		cfg.Field(config.BaseReview, "review_note"),
+		cfg.Field(config.BaseReview, "archived"),
+	}
+}
 
 // rowSep 是幂等键的分隔符。用不可见字符，避免发票号码里出现分隔符造成歧义。
 const rowSep = "\x1f"
@@ -65,10 +72,15 @@ func RunSync(opts SyncOptions) error {
 	if err != nil {
 		return err
 	}
-	appToken := cfg.Feishu.Bitable.AppToken
-	tableID := cfg.Feishu.Bitable.Tables["submission"]
+	base, _ := cfg.Base(config.BaseReview)
+	appToken := base.AppToken
+	tableID := cfg.Table(config.BaseReview, "review")
 	if appToken == "" || tableID == "" {
-		return fmt.Errorf("配置缺少 bitable.app_token / tables.submission")
+		appToken = cfg.Feishu.Bitable.AppToken
+		tableID = cfg.Feishu.Bitable.Tables["submission"]
+	}
+	if appToken == "" || tableID == "" {
+		return fmt.Errorf("配置缺少核对表 base/table")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
@@ -105,7 +117,7 @@ func RunSync(opts SyncOptions) error {
 	fmt.Println()
 
 	client := feishu.NewClient(cfg.Feishu.BaseURL, cfg.Feishu.AppID, cfg.Feishu.AppSecret)
-	existing, err := existingRows(ctx, client, appToken, tableID)
+	existing, err := existingRows(ctx, cfg, client, appToken, tableID)
 	if err != nil {
 		return fmt.Errorf("读取已有记录失败: %w", err)
 	}
@@ -139,7 +151,7 @@ func RunSync(opts SyncOptions) error {
 				skipped++
 				continue
 			}
-			fields, err := buildRowFields(ctx, client, appToken, row, dryRun)
+			fields, err := buildRowFields(ctx, cfg, client, appToken, row, dryRun)
 			if err != nil {
 				failed++
 				fmt.Printf("  ✗ %s #%d 组装失败: %v\n", short(code), row.GroupIdx, err)
@@ -147,20 +159,28 @@ func RunSync(opts SyncOptions) error {
 			}
 			if recID != "" {
 				// 保留人已做出的判断（通过/驳回），绝不覆盖。
-				for _, k := range humanFields {
+				for _, k := range humanFields(cfg) {
 					delete(fields, k)
 				}
 				// ★ 差异说明里可能带着 notify 打的「已通知」标记 —— 不能抹掉。
 				//   抹掉的后果是每同步一次就重新私信打扰一次。
 				if strings.Contains(old.Note, notifiedMark) {
-					if s, _ := fields["差异说明"].(string); !strings.Contains(s, notifiedMark) {
-						fields["差异说明"] = strings.TrimSpace(s + " " + notifiedMark)
+					if s, _ := fields[cfg.Field(config.BaseReview, "explain")].(string); !strings.Contains(s, notifiedMark) {
+						fields[cfg.Field(config.BaseReview, "explain")] = strings.TrimSpace(s + " " + notifiedMark)
 					}
 				}
-				// 「人还没表态 且 该行机器核对一致」→ 自动通过。
+				// ★ 只填空单元格：目标单元格已有值 → 不写。
+				//   顺带解决了两个老毛病：附件不再每次重传；已归档不会被写回 false。
+				fields = blankOnly(cfg, old.Fields, fields, serviceOwnedSet(cfg))
+				// 「人还没表态（空/待审）且该行核对一致」→ 自动通过。
 				// 这就是 review.auto_pass_clean 的语义：没察觉到错误就不打扰人。
-				if cfg.Review.AutoPass() && old.Review == "待审" && row.Verdict == "一致" && row.Problem == "" {
-					fields["人工审核"] = "通过"
+				if cfg.Review.AutoPass() && (old.Review == "" || old.Review == "待审") &&
+					row.Verdict == "一致" && row.Problem == "" {
+					fields[cfg.Field(config.BaseReview, "human_review")] = cfg.Dict.Rules.ReviewPass
+				}
+				if len(fields) == 0 {
+					skipped++
+					continue
 				}
 				if dryRun {
 					fmt.Printf("  ~ %s #%d %s\n", short(code), row.GroupIdx, row.title())
@@ -346,53 +366,64 @@ func explainRow(r plannedRow) string {
 // ────────────────────────── 字段组装 ──────────────────────────
 
 // buildRowFields 把一行组装成「报销核对」表的字段。
-func buildRowFields(ctx context.Context, c *feishu.Client, appToken string, r plannedRow, dryRun bool) (map[string]any, error) {
-	// 人工审核初值由核对结果决定（见 config.review.auto_pass_clean）：
-	//   一致 → 直接「通过」（只有出错才需要人）
-	//   其余 → 「待审」，并由 notify 发私信
+func buildRowFields(ctx context.Context, cfg *config.Config, c *feishu.Client, appToken string, r plannedRow, dryRun bool) (map[string]any, error) {
+	// 人工审核初值由校验结果决定（docs/30-review/33 §4）：
+	//   全部一致 → 「通过」（服务随后会自动同意审批）
+	//   有问题   → 「驳回」（等人处理；人同意审批后会被覆盖为「通过」）
 	// 注意：更新已有行时调用方会删掉该字段，绝不覆盖人已做出的判断。
-	initialReview := "待审"
+	failWord := "驳回"
+	passWord := "通过"
+	if cfg != nil {
+		if v := cfg.Dict.Rules.ReviewFail; v != "" {
+			failWord = v
+		}
+		if v := cfg.Dict.Rules.ReviewPass; v != "" {
+			passWord = v
+		}
+	}
+	initialReview := failWord
 	if r.Verdict == "一致" && r.Problem == "" {
-		initialReview = "通过"
+		initialReview = passWord
 	}
 
 	f := map[string]any{
-		"审批实例号": r.Sub.InstanceCode,
-		"人工审核":  initialReview,
-		"已归档":   false,
+		cfg.Field(config.BaseReview, "instance_no"):  r.Sub.InstanceCode,
+		cfg.Field(config.BaseReview, "human_review"): initialReview,
+		cfg.Field(config.BaseReview, "archived"):     false,
 	}
 	setStr := func(k, v string) {
 		if strings.TrimSpace(v) != "" {
 			f[k] = strings.TrimSpace(v)
 		}
 	}
+	R := func(k string) string { return cfg.Field(config.BaseReview, k) }
 
 	// ── 审批与表单字段 ──
 	// ★ 超链接字段(type 15)必须写 {"link","text"} 对象，不能写纯字符串
 	//   —— 否则报 1254068 URLFieldConvFail（实测踩过）。
 	if r.Sub.Applink != "" {
-		f["申请编号"] = map[string]string{"link": r.Sub.Applink, "text": "查看审批单"}
+		f[R("applink")] = map[string]string{"link": r.Sub.Applink, "text": "查看审批单"}
 	}
-	setStr("申请状态", statusWord(r.Sub.Status))
+	setStr(R("apply_status"), statusWord(r.Sub.Status))
 	if r.Sub.StartTimeMS != nil {
-		f["发起时间"] = *r.Sub.StartTimeMS
+		f[R("start_time")] = *r.Sub.StartTimeMS
 	}
-	setStr("发起人", r.Sub.Applicant)
-	setStr("发起人部门", r.Sub.ApplicantDept)
+	setStr(R("applicant"), r.Sub.Applicant)
+	setStr(R("applicant_dept"), r.Sub.ApplicantDept)
 	if len(r.Sub.Departments) > 0 {
-		f["物资所属部门"] = r.Sub.Departments
+		f[R("departments")] = r.Sub.Departments
 	}
-	setStr("物资种类", r.Sub.MaterialType)
-	setStr("购买人", r.Sub.Buyer)
-	setStr("资金来源", r.Sub.FundSource)
-	setStr("是否为支付宝付款", r.Sub.IsAlipay)
+	setStr(R("material_type"), r.Sub.MaterialType)
+	setStr(R("buyer"), r.Sub.Buyer)
+	setStr(R("fund_source"), r.Sub.FundSource)
+	setStr(R("is_alipay"), r.Sub.IsAlipay)
 
 	// ── 本行（一张发票）──
 	//
 	// 只写"对人有用"的：发票号码是幂等键 + 核对时的第一对照项，必须留。
 	// 配对键（订单号/支付宝交易号）、分组序号、号码来源都是中间产物 ——
 	// 它们要表达的意思已经合并进「差异说明」的一句话里，不再单列。
-	setStr("发票号码", r.InvoiceNo)
+	setStr(R("invoice_no"), r.InvoiceNo)
 
 	// ── 图读结果（以本行发票为准）──
 	inv := firstEvidence(r.InvoiceEvs)
@@ -401,45 +432,45 @@ func buildRowFields(ctx context.Context, c *feishu.Client, appToken string, r pl
 	}
 	if inv != nil {
 		if inv.AmountInclTaxCent != nil {
-			f["图读金额(元)"] = centsToYuan(*inv.AmountInclTaxCent)
+			f[R("amount")] = centsToYuan(*inv.AmountInclTaxCent)
 		}
 		if inv.TaxCent != nil {
-			f["图读税额(元)"] = centsToYuan(*inv.TaxCent)
+			f[R("tax")] = centsToYuan(*inv.TaxCent)
 		}
 		if inv.Date != "" {
 			if t, err := time.ParseInLocation("2006-01-02", inv.Date, time.Local); err == nil {
-				f["图读日期"] = t.UnixMilli()
+				f[R("invoice_date")] = t.UnixMilli()
 			}
 		}
-		setStr("销方名称", inv.Counterparty)
+		setStr(R("seller"), inv.Counterparty)
 	}
 
 	// ── 图片 → 附件字段（上传换 file_token）──
-	if err := attach(ctx, c, appToken, f, "发票", r.InvoiceEvs, dryRun); err != nil {
+	if err := attach(ctx, c, appToken, f, R("invoice_att"), r.InvoiceEvs, dryRun); err != nil {
 		return nil, err
 	}
-	if err := attach(ctx, c, appToken, f, "订单截图", r.OrderEvs, dryRun); err != nil {
+	if err := attach(ctx, c, appToken, f, R("order_att"), r.OrderEvs, dryRun); err != nil {
 		return nil, err
 	}
-	if err := attach(ctx, c, appToken, f, "付款记录", r.PaymentEvs, dryRun); err != nil {
+	if err := attach(ctx, c, appToken, f, R("payment_att"), r.PaymentEvs, dryRun); err != nil {
 		return nil, err
 	}
 	// 兜底行：把整实例的图都挂上（否则人工看不到任何图）。
 	if r.Group == nil {
-		if err := attach(ctx, c, appToken, f, "发票", inKind(r.AllEvs, "invoice"), dryRun); err != nil {
+		if err := attach(ctx, c, appToken, f, R("invoice_att"), inKind(r.AllEvs, "invoice"), dryRun); err != nil {
 			return nil, err
 		}
-		if err := attach(ctx, c, appToken, f, "订单截图", inKind(r.AllEvs, "order"), dryRun); err != nil {
+		if err := attach(ctx, c, appToken, f, R("order_att"), inKind(r.AllEvs, "order"), dryRun); err != nil {
 			return nil, err
 		}
-		if err := attach(ctx, c, appToken, f, "付款记录", inKind(r.AllEvs, "payment"), dryRun); err != nil {
+		if err := attach(ctx, c, appToken, f, R("payment_att"), inKind(r.AllEvs, "payment"), dryRun); err != nil {
 			return nil, err
 		}
 	}
 
 	// ── 核对结论 ──
-	f["核对结果"] = r.Verdict
-	setStr("差异说明", r.Explain)
+	f[R("verdict")] = r.Verdict
+	setStr(R("explain"), r.Explain)
 	return f, nil
 }
 
@@ -687,29 +718,33 @@ type existingRow struct {
 	Verdict   string // 核对结果
 	Note      string // 差异说明（可能带 notify 打的「已通知」标记）
 
+	// Fields 是该行的原始字段值（"只填空单元格"要用它判断哪些列已有值）。
+	Fields map[string]json.RawMessage
+
 	// Taken 只在 RunSync 内部用于"旧行已被本实例的第一行接管"的标记。
 	Taken bool
 }
 
 // existingRows 返回源表里的全部行。
-func existingRows(ctx context.Context, c *feishu.Client, appToken, tableID string) ([]existingRow, error) {
+func existingRows(ctx context.Context, cfg *config.Config, c *feishu.Client, appToken, tableID string) ([]existingRow, error) {
 	recs, err := c.SearchBitableRecords(ctx, appToken, tableID, nil, 500)
 	if err != nil {
 		return nil, err
 	}
 	var out []existingRow
 	for _, r := range recs {
-		code := textOfField(r.Fields["审批实例号"])
+		code := textOfField(r.Fields[cfg.Field(config.BaseReview, "instance_no")])
 		if code == "" {
 			continue
 		}
 		out = append(out, existingRow{
 			RecordID:  r.RecordID,
 			Code:      code,
-			InvoiceNo: textOfField(r.Fields["发票号码"]),
-			Review:    textOfField(r.Fields["人工审核"]),
-			Verdict:   textOfField(r.Fields["核对结果"]),
-			Note:      textOfField(r.Fields["差异说明"]),
+			InvoiceNo: textOfField(r.Fields[cfg.Field(config.BaseReview, "invoice_no")]),
+			Review:    textOfField(r.Fields[cfg.Field(config.BaseReview, "human_review")]),
+			Verdict:   textOfField(r.Fields[cfg.Field(config.BaseReview, "verdict")]),
+			Note:      textOfField(r.Fields[cfg.Field(config.BaseReview, "explain")]),
+			Fields:    r.Fields,
 		})
 	}
 	return out, nil
@@ -720,13 +755,18 @@ func existingRows(ctx context.Context, c *feishu.Client, appToken, tableID strin
 // 用途：审批被退回/撤回时，该单不该继续留在核对表里（需求原话：
 // "被退回的就剔除掉"）。本地库用 store.DeleteInstance 清，表里用本函数清。
 func PurgeInstance(ctx context.Context, cfg *config.Config, instanceCode string) (int, error) {
-	appToken := cfg.Feishu.Bitable.AppToken
-	tableID := cfg.Feishu.Bitable.Tables["submission"]
+	base, _ := cfg.Base(config.BaseReview)
+	appToken := base.AppToken
+	tableID := cfg.Table(config.BaseReview, "review")
 	if appToken == "" || tableID == "" {
-		return 0, fmt.Errorf("配置缺少 bitable.app_token / tables.submission")
+		appToken = cfg.Feishu.Bitable.AppToken
+		tableID = cfg.Feishu.Bitable.Tables["submission"]
+	}
+	if appToken == "" || tableID == "" {
+		return 0, fmt.Errorf("配置缺少核对表 base/table")
 	}
 	client := feishu.NewClient(cfg.Feishu.BaseURL, cfg.Feishu.AppID, cfg.Feishu.AppSecret)
-	rows, err := existingRows(ctx, client, appToken, tableID)
+	rows, err := existingRows(ctx, cfg, client, appToken, tableID)
 	if err != nil {
 		return 0, err
 	}
@@ -781,8 +821,13 @@ func runRecheck(cfgPath string, dryRun bool) error {
 		fmt.Println("review.auto_pass_clean = false，无需补正")
 		return nil
 	}
-	appToken := cfg.Feishu.Bitable.AppToken
-	tableID := cfg.Feishu.Bitable.Tables["submission"]
+	base, _ := cfg.Base(config.BaseReview)
+	appToken := base.AppToken
+	tableID := cfg.Table(config.BaseReview, "review")
+	if appToken == "" || tableID == "" {
+		appToken = cfg.Feishu.Bitable.AppToken
+		tableID = cfg.Feishu.Bitable.Tables["submission"]
+	}
 	if appToken == "" || tableID == "" {
 		return fmt.Errorf("配置缺少 bitable")
 	}
@@ -790,7 +835,7 @@ func runRecheck(cfgPath string, dryRun bool) error {
 	defer cancel()
 	client := feishu.NewClient(cfg.Feishu.BaseURL, cfg.Feishu.AppID, cfg.Feishu.AppSecret)
 
-	rows, err := existingRows(ctx, client, appToken, tableID)
+	rows, err := existingRows(ctx, cfg, client, appToken, tableID)
 	if err != nil {
 		return err
 	}
@@ -806,7 +851,10 @@ func runRecheck(cfgPath string, dryRun bool) error {
 			continue
 		}
 		if err := client.UpdateBitableRecord(ctx, appToken, tableID, row.RecordID,
-			map[string]any{"人工审核": "通过", "审核备注": "自动通过（核对一致，无需人工）"}); err != nil {
+			map[string]any{
+				cfg.Field(config.BaseReview, "human_review"): cfg.Dict.Rules.ReviewPass,
+				cfg.Field(config.BaseReview, "review_note"):  "自动通过（核对一致，无需人工）",
+			}); err != nil {
 			fmt.Printf("  ✗ %s 更新失败: %v\n", short(row.Code), err)
 			continue
 		}

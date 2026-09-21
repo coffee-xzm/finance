@@ -63,10 +63,23 @@ func writable(v json.RawMessage) any {
 }
 
 // carryFields 是从源表复制到整合表的字段（其余留在源表作为过程痕迹）。
-var carryFields = []string{
-	"审批实例号", "发票号码", "申请编号",
-	"物资所属部门", "物资种类", "购买人", "资金来源", "是否为支付宝付款",
-	"图读金额(元)", "图读税额(元)", "图读日期", "销方名称", "审核备注",
+// 字段名从 config 字典取，避免 Go 常量与线上表头各写一份（docs/30-review/33 §3）。
+func carryFields(cfg *config.Config) []string {
+	return []string{
+		cfg.Field(config.BaseReview, "instance_no"),
+		cfg.Field(config.BaseReview, "invoice_no"),
+		cfg.Field(config.BaseReview, "applink"),
+		cfg.Field(config.BaseReview, "departments"),
+		cfg.Field(config.BaseReview, "material_type"),
+		cfg.Field(config.BaseReview, "buyer"),
+		cfg.Field(config.BaseReview, "fund_source"),
+		cfg.Field(config.BaseReview, "is_alipay"),
+		cfg.Field(config.BaseReview, "amount"),
+		cfg.Field(config.BaseReview, "tax"),
+		cfg.Field(config.BaseReview, "invoice_date"),
+		cfg.Field(config.BaseReview, "seller"),
+		cfg.Field(config.BaseReview, "review_note"),
+	}
 }
 
 func RunArchive(opts ArchiveOptions) error {
@@ -109,15 +122,19 @@ func RunArchive(opts ArchiveOptions) error {
 	client := feishu.NewClient(cfg.Feishu.BaseURL, cfg.Feishu.AppID, cfg.Feishu.AppSecret)
 
 	if opts.Repair {
-		return runRepair(ctx, client, db, appToken, dstID, dryRun)
+		return runRepair(ctx, cfg, client, db, appToken, dstID, dryRun)
 	}
 
-	// 筛选：人工审核=通过 且 已归档 未勾选
+	// 筛选：人工审核=通过 且 已归档 未勾选（字段名与"通过"口径都来自 config）
+	passWord := cfg.Dict.Rules.ReviewPass
+	if passWord == "" {
+		passWord = "通过"
+	}
 	filter := map[string]any{
 		"conjunction": "and",
 		"conditions": []map[string]any{
-			{"field_name": "人工审核", "operator": "is", "value": []string{"通过"}},
-			{"field_name": "已归档", "operator": "is", "value": []string{"false"}},
+			{"field_name": cfg.Field(config.BaseReview, "human_review"), "operator": "is", "value": []string{passWord}},
+			{"field_name": cfg.Field(config.BaseReview, "archived"), "operator": "is", "value": []string{"false"}},
 		},
 	}
 	recs, err := client.SearchBitableRecords(ctx, appToken, srcID, filter, 200)
@@ -133,7 +150,7 @@ func RunArchive(opts ArchiveOptions) error {
 	archived := map[string]bool{}
 	if dst, err := client.SearchBitableRecords(ctx, appToken, dstID, nil, 500); err == nil {
 		for _, r := range dst {
-			if s := fieldText2(r.Fields["来源行"]); s != "" {
+			if s := fieldText2(r.Fields[cfg.Field(config.BaseReview, "source_row")]); s != "" {
 				archived[s] = true
 			}
 		}
@@ -155,27 +172,27 @@ func RunArchive(opts ArchiveOptions) error {
 			// 顺手把标记补上，让源表状态与事实一致
 			if !dryRun {
 				_ = client.UpdateBitableRecord(ctx, appToken, srcID, r.RecordID,
-					map[string]any{"已归档": true})
+					map[string]any{cfg.Field(config.BaseReview, "archived"): true})
 			}
 			continue
 		}
 		fields := map[string]any{}
 		// 重新上传三张图（跨表不能复用 file_token）
-		if inst := textOfField(r.Fields["审批实例号"]); inst != "" {
+		if inst := textOfField(r.Fields[cfg.Field(config.BaseReview, "instance_no")]); inst != "" {
 			up := uploadImages(ctx, client, db, appToken, inst, fields)
 			if up == 0 {
 				noAttach++
 			}
 		}
-		for _, k := range carryFields {
+		for _, k := range carryFields(cfg) {
 			v, exists := r.Fields[k]
 			if !exists || len(v) == 0 || string(v) == "null" {
 				continue
 			}
 			fields[k] = writable(v)
 		}
-		fields["来源行"] = r.RecordID
-		fields["归档时间"] = time.Now().UnixMilli()
+		fields[cfg.Field(config.BaseReview, "source_row")] = r.RecordID
+		fields[cfg.Field(config.BaseReview, "archive_time")] = time.Now().UnixMilli()
 
 		if dryRun {
 			b, _ := json.Marshal(fields)
@@ -191,8 +208,8 @@ func RunArchive(opts ArchiveOptions) error {
 		}
 		// 复制成功后才标记 —— 保证"标记了 = 确实归档过"
 		err = client.UpdateBitableRecord(ctx, appToken, srcID, r.RecordID, map[string]any{
-			"已归档":  true,
-			"审核时间": time.Now().UnixMilli(),
+			cfg.Field(config.BaseReview, "archived"):    true,
+			cfg.Field(config.BaseReview, "review_time"): time.Now().UnixMilli(),
 		})
 		if err != nil {
 			fmt.Printf("  ⚠ %s 已复制但标记失败（下次会重复归档，需人工核对）: %v\n", r.RecordID, err)
@@ -337,7 +354,7 @@ func fieldText2(raw json.RawMessage) string { return textOfField(raw) }
 //
 // 为什么会有"缺附件"的行：归档时本地路径取不到（manifest 被覆盖 + local_png 是后加的列），
 // 于是复制了字段但没传图。图其实还在磁盘上，本函数把它们补回去。
-func runRepair(ctx context.Context, c *feishu.Client, db *store.DB,
+func runRepair(ctx context.Context, cfg *config.Config, c *feishu.Client, db *store.DB,
 	appToken, dstID string, dryRun bool) error {
 
 	recs, err := c.SearchBitableRecords(ctx, appToken, dstID, nil, 500)
@@ -348,12 +365,16 @@ func runRepair(ctx context.Context, c *feishu.Client, db *store.DB,
 
 	fixed, skipped := 0, 0
 	for _, r := range recs {
-		inst := textOfField(r.Fields["审批实例号"])
+		inst := textOfField(r.Fields[cfg.Field(config.BaseReview, "instance_no")])
 		if inst == "" {
 			continue
 		}
 		has := 0
-		for _, k := range []string{"发票", "订单截图", "付款记录"} {
+		for _, k := range []string{
+			cfg.Field(config.BaseReview, "invoice_att"),
+			cfg.Field(config.BaseReview, "order_att"),
+			cfg.Field(config.BaseReview, "payment_att"),
+		} {
 			var arr []any
 			if json.Unmarshal(r.Fields[k], &arr) == nil {
 				has += len(arr)
