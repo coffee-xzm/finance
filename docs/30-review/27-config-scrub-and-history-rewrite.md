@@ -223,3 +223,33 @@ HEAD 现在位于 b696f50
   否则 applink 指向飞书品牌的审批小程序。
 - 机器人上 `/tmp/finance-push.bundle` 用完即删（脚本里已处理）。
 - 机器人仍可能因为外网不稳而无法 `git pull`；日常部署建议直接用 `push-to-robot.sh`。
+
+---
+
+## 2026-09-21 复查：守卫的两个毛病 + 一次真实脱敏
+
+**发现 1：守卫会拦下任何正常提交（误伤）**
+
+`gen-blocklist.sh` 原来有个 `has_cjk` 分支，把 config.yml 里**所有含中文的值**都当真值拉黑，
+于是 `通过 / 待办 / 驳回 / 技术组物资 / 项目组物资 / -采购审批` 这些**业务词汇**也进了黑名单，
+而源码里必然出现它们（HEAD 里 55 个文件含"通过"）——实测只暂存 `cmd/serve/catchup.go`
+就被拒（"命中真实值黑名单（已通…）"）。
+
+- 现在只保留"标识符型"判定（含数字的短标识 / 长 token），黑名单从 20 条降到 **11 条**，
+  剩下的正好是 app_id / app_secret / OCR key / app_token ×3 / 审批 code ×2 / user_id / 表 id ×2。
+- 若某个**中文**值确实敏感（例如专有表单名），手工写进 `.git/secret-extra`（只在本机 .git/ 下）。
+- 另外把长数字正则加上 `(?<!widget)`：飞书表单控件 id `widget17893053389170001` 是
+  **功能必需**（dict 靠它预填控件），不在 config.yml 里，只能这样排除该前缀。
+- 合成夹具（`bitable-plugin/testdata/`、`src/core/cases.ts` 里的假发票号）加进白名单 ——
+  那些数字与 `internal/naming` 的"命名冻结向量"共用，改了会破坏两端一致性。
+
+**发现 2：工作区里有未提交的真实密钥**
+
+`docs/00-brief/02-feishu-capability-facts.md`、`docs/30-review/27-...md` 等**未提交**的改动里
+写着真实 `app_secret` 与 OCR `sk-…`（已确认 `git grep HEAD` 里**没有**，即历史干净）。
+本次一并脱敏：真实标识符（app_id / app_token / 表 id / 部门 id / user_id / 审批 code / 实例号）
+从源码与文档移除，改由 config.yml 提供（部门 id 与 base token 本来就有配置项），
+代码里只留注释级的截断形式。
+
+**顺带**：`BLOCKED_PATHS` 扩到 `config\.ya?ml(\\.|$)`，把 `config.yml.bak-*` 这类备份也挡住
+（机器人上就留着一个，里面同样是明文密钥；已 chmod 600）。
