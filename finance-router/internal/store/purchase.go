@@ -102,6 +102,41 @@ func (d *DB) SetPurchaseDraft(ctx context.Context, instanceCode, state, lastErr 
 	return err
 }
 
+// PurchaseByLedgerRecord 反查：某条流水行是哪笔采购写的（结算登记单时要用它
+// 判断"这笔采购的明细是否都登记完了"）。
+func (d *DB) PurchaseByLedgerRecord(ctx context.Context, recordID string) (*PurchaseSync, bool, error) {
+	if recordID == "" {
+		return nil, false, nil
+	}
+	var p PurchaseSync
+	var ledger, request, flowReg string
+	// ledger_record_ids 是 JSON 数组文本；record_id 里不会有 LIKE 的通配符
+	err := d.sql.QueryRowContext(ctx, `
+		SELECT purchase_instance_code, approval_code, applicant_user_id, purchase_status,
+		       project_group, mirror_record_id, ledger_record_ids, request_record_ids,
+		       flow_register_codes, invoice_instance_code, draft_state, last_error, created_at, updated_at
+		  FROM purchase_sync WHERE ledger_record_ids LIKE ? LIMIT 1`, "%"+recordID+"%").
+		Scan(&p.PurchaseInstanceCode, &p.ApprovalCode, &p.ApplicantUserID, &p.PurchaseStatus,
+			&p.ProjectGroup, &p.MirrorRecordID, &ledger, &request, &flowReg, &p.InvoiceInstanceCode,
+			&p.DraftState, &p.LastError, &p.CreatedAt, &p.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if ledger != "" {
+		_ = json.Unmarshal([]byte(ledger), &p.LedgerRecordIDs)
+	}
+	if request != "" {
+		_ = json.Unmarshal([]byte(request), &p.RequestRecordIDs)
+	}
+	if flowReg != "" {
+		_ = json.Unmarshal([]byte(flowReg), &p.FlowRegisterCodes)
+	}
+	return &p, true, nil
+}
+
 // PurchaseByInvoice 反查：某个发票收集实例是由哪条采购代建的（发票收齐后要回写流水进度）。
 func (d *DB) PurchaseByInvoice(ctx context.Context, invoiceInstanceCode string) (*PurchaseSync, bool, error) {
 	if invoiceInstanceCode == "" {

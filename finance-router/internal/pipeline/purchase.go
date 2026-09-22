@@ -234,22 +234,41 @@ func RunPurchase(ctx context.Context, opts PurchaseOptions) error {
 		}
 	}
 
-	// ── ④ 给财务登记人开「27-流水登记」（每条明细一张），退回发起 + 私信通知 ──
+	// ── ④ 把流水交给登记人（两种模式），全部都登记完了才开票 ──
 	//
-	// 用户 2026-09-21 定的新流程：采购通过后**先不**给提交人开发票单，
+	// 用户 2026-09-21/22 定的新流程：采购通过后**先不**给提交人开发票单，
 	// 先让流水登记人核对/补齐（登记数据为准），全部明细都登记完成后
 	// 由 maybeCreateInvoiceForPurchase() 再给提交人开票。
 	//
-	// 未配登记人（或 flow_register.disabled）时退回旧行为：直接开票 ——
-	// 这样配置没到位也不会把链路卡死。
+	// flow_register.mode：
+	//   notify（默认）= **不代建审批**，只私信登记人待登记内容，由他自己发「27-流水登记」；
+	//   draft          = 代建预填好的登记单并退回到发起（要求该审批有真实审批人）；
+	//   未配登记人 / disabled → 退回旧行为：直接开票（配置没到位也不会卡死链路）。
 	registerCodes := make([]string, len(info.Items))
 	if prev, ok, _ := db.GetPurchase(ctx, info.InstanceCode); ok {
 		copy(registerCodes, prev.FlowRegisterCodes)
 	}
 	invoiceCode := ""
+	registerNotifyErr := ""
 	registerAppr, hasRegister := cfg.ApprovalByRole(config.RoleLedgerRegister)
-	useRegister := hasRegister && registerAppr.Code != "" && cfg.RegisterUserID() != "" && !cfg.FlowRegister.Disabled
+	mode := cfg.RegisterMode()
+	useRegister := hasRegister && registerAppr.Code != "" && cfg.RegisterUserID() != "" &&
+		!cfg.FlowRegister.Disabled && mode != "off"
 	switch {
+	case useRegister && mode == "notify":
+		// 只发私信：登记人自己开单，提交即通过 → 事件回来时按备注/金额匹配流水行
+		if opts.DryRun {
+			fmt.Printf("  [dry-run] 将私信登记人 %s：为 %d 条明细做流水登记\n",
+				cfg.RegisterUserID(), len(info.Items))
+			break
+		}
+		if err := notifyPendingRegister(ctx, cfg, client, info, ledgerIDs); err != nil {
+			fmt.Printf("  ⚠ 通知登记人失败（不影响流水）: %v\n", err)
+			registerNotifyErr = err.Error()
+		} else {
+			fmt.Printf("  ✓ 已私信登记人 %s：请为 %d 条明细做流水登记\n",
+				cfg.RegisterUserID(), len(info.Items))
+		}
 	case useRegister:
 		created := 0
 		var itemErrs, blockedErrs []string
@@ -399,7 +418,7 @@ func RunPurchase(ctx context.Context, opts PurchaseOptions) error {
 			LedgerRecordIDs: ledgerIDs, RequestRecordIDs: requestIDs,
 			FlowRegisterCodes:   registerCodes,
 			InvoiceInstanceCode: invoiceCode,
-			DraftState:          "awaiting_applicant",
+			DraftState:          draftStateFor(mode, invoiceCode, registerNotifyErr),
 		}); err != nil {
 			return fmt.Errorf("写本地采购记录失败: %w", err)
 		}
@@ -407,6 +426,18 @@ func RunPurchase(ctx context.Context, opts PurchaseOptions) error {
 	fmt.Printf("✓ 采购 %s 处理完成（流水 %d 行，流水登记 %d 张，发票单 %s）\n",
 		short(info.InstanceCode), len(ledgerIDs), len(registerCodes), short(invoiceCode))
 	return nil
+}
+
+// draftStateFor 决定本地记录的 draft_state —— 它同时是补漏扫描的幂等锚点，
+// 所以口径要说清：failed = 可以自动重试；其余 = 已处理过（别重复动作）。
+func draftStateFor(mode, invoiceCode, notifyErr string) string {
+	if mode == "notify" {
+		if notifyErr != "" {
+			return "failed" // 私信没发出去 → 让补漏扫描重试
+		}
+		return "awaiting_register"
+	}
+	return "awaiting_applicant"
 }
 
 // ledgerRecordIDAt 安全取第 i 个流水行 id（明细数与流水行数理论上一一对应，

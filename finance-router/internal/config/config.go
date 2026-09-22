@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -64,10 +65,28 @@ type FlowRegister struct {
 	UserName string `yaml:"user_name"`
 	// Disabled 置 true 时退回旧流程（采购通过直接给提交人开票），用于应急。
 	Disabled bool `yaml:"disabled"`
+	// Mode 决定"采购通过后怎么把流水交给登记人"：
+	//   notify（默认）= **不代建审批**，只把待登记内容私信给登记人，由他自己开
+	//                  「27-流水登记」；提交即通过后系统按备注/金额匹配到流水行并覆盖。
+	//   draft          = 代建预填好的登记单并"退回到发起"（要求该审批有**真实审批人**：
+	//                  节点是"自动通过"时建单即 APPROVED，没有待办可退回 —— 实测 10112）。
+	// 用户 2026-09-22 选定 notify。
+	Mode string `yaml:"mode"`
 }
 
 // RegisterUserID 返回登记人 user_id（未配置则空）。
 func (c *Config) RegisterUserID() string { return c.FlowRegister.UserID }
+
+// RegisterMode 归一化后的模式："" / off / draft / notify。
+//
+// 未配置时取 notify（用户 2026-09-22 定：该审批没有审批人，代建后无法退回到发起）。
+func (c *Config) RegisterMode() string {
+	m := strings.ToLower(strings.TrimSpace(c.FlowRegister.Mode))
+	if m == "" {
+		return "notify"
+	}
+	return m
+}
 
 // ZipEnabled 返回是否打 zip（默认 true）。
 func (e Export) ZipEnabled() bool {

@@ -340,6 +340,51 @@ func notifyRegistrant(ctx context.Context, cfg *config.Config, client *feishu.Cl
 		fmt.Sprintf("采购「%s」的代建流水登记单已创建", info.ProjectName))
 }
 
+// notifyPendingRegister 是 notify 模式的核心动作：**不代建审批**，只把待登记内容
+// 私信给登记人，由他自己在飞书里发一张「27-流水登记」。
+//
+// 为什么这么设计（用户 2026-09-22 选定）：「27-流水登记」的审批节点是「自动通过」，
+// 用 API 代建的话实例会立刻 APPROVED（timeline 只有 START→AUTO_PASS），既没有待办
+// 可退回（10112 no permission over task），登记人也拿不到可编辑的表单 ——
+// "先填再撤回"落不了地。改成私信后：备注照抄即可，系统按**备注/金额**把登记数据
+// 匹配回对应的流水行（见 matchLedgerRowForRegister）。
+func notifyPendingRegister(ctx context.Context, cfg *config.Config, client *feishu.Client,
+	info *purchaseInfo, ledgerIDs []string) error {
+
+	userID := cfg.RegisterUserID()
+	if userID == "" {
+		return fmt.Errorf("config 缺 flow_register.user_id，无法通知登记人")
+	}
+	text := buildRegisterNotice(cfg, info)
+	return sendWithAdminFallback(ctx, cfg, client, userID, text,
+		fmt.Sprintf("采购「%s」通过后需要做 %d 笔流水登记（请提醒登记人）",
+			info.ProjectName, len(info.Items)))
+}
+
+// buildRegisterNotice 是 notify 模式发给登记人的正文（纯函数，便于单测）：
+// 每条明细给出金额与**要照抄的备注**（备注就是后面匹配流水行的键）。
+func buildRegisterNotice(cfg *config.Config, info *purchaseInfo) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "【流水登记】采购审批「%s」已通过，请为下面 %d 笔流水各发一张「27-流水登记」：\n",
+		info.ProjectName, len(info.Items))
+	for i, it := range info.Items {
+		fmt.Fprintf(&b, "\n%d. %s　金额 %.2f", i+1, it.Name, ledgerAmount(it))
+		if it.Qty > 0 {
+			fmt.Fprintf(&b, "（%s × %s）", trimNum(it.Amount), trimNum(it.Qty))
+		}
+		fmt.Fprintf(&b, "\n   备注请照抄：%s", ledgerNote(info, it))
+	}
+	fmt.Fprintf(&b, "\n\n采购审批：%s\n", buildApprovalApplink(cfg, info.InstanceCode))
+	b.WriteString("\n填法：类型选「支出」，金额照上面填；转账日期填实际转账日；上传转账截图；" +
+		"金额来源/金额去向按实际选。\n" +
+		"提交即通过 —— 系统靠**备注**把这笔登记对到「27 - 收支表」对应行并覆盖，" +
+		"该采购全部明细登记完成后会给采购提交人开「27发票收集」。")
+	return b.String()
+}
+
+// trimNum 打印数量/单价时不带多余小数位。
+func trimNum(f float64) string { return strconv.FormatFloat(f, 'f', -1, 64) }
+
 // RunFlowRegister 处理一张**已通过**的「27-流水登记」：
 // 覆盖流水行 → （该采购所有明细都登记完时）开票 + 通知提交人。
 func RunFlowRegister(ctx context.Context, opts FlowRegisterOptions) error {
@@ -386,7 +431,7 @@ func RunFlowRegister(ctx context.Context, opts FlowRegisterOptions) error {
 	ff.ApplicantOID = det.OpenID
 	ff.InstanceCode = det.InstanceCode
 
-	// 目标流水行：本地映射优先，其次按「流水审批ID」反查（幂等锚点）
+	// 目标流水行：① 本地映射 ②「流水审批ID」反查 ③ 备注精确匹配 ④ 金额匹配
 	ledgerRecID, purchaseCode := "", ""
 	if r, ok, err := db.GetFlowRegister(ctx, opts.Instance); err == nil && ok {
 		ledgerRecID, purchaseCode = r.LedgerRecordID, r.PurchaseInstanceCode
@@ -396,23 +441,36 @@ func RunFlowRegister(ctx context.Context, opts FlowRegisterOptions) error {
 		}
 	}
 	if ledgerRecID == "" && purchaseCode != "" {
-		// 本地有映射但没记到行（例如退回失败时提前落的痕）→ 按明细序号对采购的流水行
+		// 本地有映射但没记到行 → 按明细序号对采购的流水行
 		if p, ok, _ := db.GetPurchase(ctx, purchaseCode); ok {
 			if it, ok2, _ := db.GetFlowRegister(ctx, opts.Instance); ok2 {
 				ledgerRecID = ledgerRecordIDAt(p.LedgerRecordIDs, it.ItemIndex-1)
 			}
 		}
 	}
+	how := ""
 	if ledgerRecID == "" {
-		if id, err := findLedgerRowByFlowID(ctx, cfg, client, flowBase.AppToken, ledgerTbl, opts.Instance); err == nil {
-			ledgerRecID = id
-		} else {
-			fmt.Printf("  ⚠ 按「流水审批ID」反查流水行失败（继续，按自建登记处理）: %v\n", err)
+		// ★ notify 模式（登记人自己开单）没有本地映射，靠**备注/金额**认行：
+		//   我们发私信时把要照抄的备注给到他，备注就是天然的对账键。
+		id, h, err := matchLedgerRowForRegister(ctx, cfg, client, flowBase.AppToken, ledgerTbl, ff, opts.Instance)
+		if err != nil {
+			return err
+		}
+		ledgerRecID, how = id, h
+	}
+	if ledgerRecID != "" && purchaseCode == "" {
+		if p, ok, _ := db.PurchaseByLedgerRecord(ctx, ledgerRecID); ok {
+			purchaseCode = p.PurchaseInstanceCode
 		}
 	}
-	fmt.Printf("▶ 流水登记 %s：类型=%s 金额=%.2f 来源=%s 去向=%s → 流水行 %s\n",
+	fmt.Printf("▶ 流水登记 %s：类型=%s 金额=%.2f 来源=%s 去向=%s → 流水行 %s%s\n",
 		short(opts.Instance), orDash(ff.Kind), ff.Amount(), orDash(ff.Source), orDash(ff.Destination),
-		orDash(short(ledgerRecID)))
+		orDash(short(ledgerRecID)), func() string {
+			if how == "" {
+				return ""
+			}
+			return "（按" + how + "匹配）"
+		}())
 
 	// 转账截图 → 多维表格附件（临时直链 24h 失效，必须转存）
 	var attach []map[string]string
@@ -551,25 +609,151 @@ func ledgerOverwriteFields(cfg *config.Config, ff *flowForm, attach []map[string
 	return f
 }
 
-// findLedgerRowByFlowID 在「27 - 收支表」里按「流水审批ID」列反查登记单对应的行。
-func findLedgerRowByFlowID(ctx context.Context, cfg *config.Config, c *feishu.Client,
-	appToken, tableID, instanceCode string) (string, error) {
+// ledgerRowView 是一条流水行里"认行"要用的几个值。
+type ledgerRowView struct {
+	RecordID  string
+	FlowID    string  // 流水审批ID 原文（含登记单 code）
+	Note      string  // 🔗 备注
+	Amount    float64 // 🔗 金额
+	Direction string  // 收支方向
+}
+
+// listLedgerRows 读全表（只读）。收支表是给人看的表，量级小（几十~几百行）。
+func listLedgerRows(ctx context.Context, cfg *config.Config, c *feishu.Client,
+	appToken, tableID string) ([]ledgerRowView, error) {
 
 	recs, err := c.SearchBitableRecords(ctx, appToken, tableID, nil, 500)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	field := cfg.Field("ledger", "flow_id")
+	F := func(k string) string { return cfg.Field("ledger", k) }
+	out := make([]ledgerRowView, 0, len(recs))
 	for i := range recs {
-		raw, ok := recs[i].Fields[field]
-		if !ok || len(raw) == 0 {
+		f := recs[i].Fields
+		out = append(out, ledgerRowView{
+			RecordID:  recs[i].RecordID,
+			FlowID:    string(f[F("flow_id")]),
+			Note:      textOfField(f[F("note")]),
+			Amount:    floatVal(f[F("amount")]),
+			Direction: textOfField(f[F("direction")]),
+		})
+	}
+	return out, nil
+}
+
+// matchLedgerRowForRegister 给一张（登记人自己开的）登记单找它该覆盖的流水行。
+//
+// 认行顺序（notify 模式下没有本地映射，必须靠数据本身）：
+//
+//	①「流水审批ID」里已经有这张登记单的 code（事件重放 / 上次部分成功）
+//	② 备注**逐字相同**（我们私信里让他照抄的备注就是为此设计的）：唯一命中即用；
+//	   多条命中 → 再用金额收敛
+//	③ 金额相同 + 收支方向相同，且该行还没被登记过（流水审批ID 为空）：唯一命中即用
+//	   （防"他改了备注"）
+//	④ 都不中 → 返回空（调用方按"登记人自建流水"新建一行）
+//
+// 命中多条时**返回错误而不是随便挑一行**：宁可让人看一眼，也不要把钱记到错的行上。
+func matchLedgerRowForRegister(ctx context.Context, cfg *config.Config, c *feishu.Client,
+	appToken, tableID string, ff *flowForm, instanceCode string) (string, string, error) {
+
+	rows, err := listLedgerRows(ctx, cfg, c, appToken, tableID)
+	if err != nil {
+		return "", "", fmt.Errorf("读收支表失败: %w", err)
+	}
+	return pickLedgerRow(rows, ff, instanceCode)
+}
+
+// pickLedgerRow 是 matchLedgerRowForRegister 的纯函数内核（便于单测）。
+func pickLedgerRow(rows []ledgerRowView, ff *flowForm, instanceCode string) (string, string, error) {
+	for _, r := range rows {
+		if instanceCode != "" && strings.Contains(r.FlowID, instanceCode) {
+			return r.RecordID, "流水审批ID", nil
+		}
+	}
+	note := strings.TrimSpace(ff.Note)
+	if note != "" {
+		var hits []ledgerRowView
+		for _, r := range rows {
+			if strings.TrimSpace(r.Note) == note {
+				hits = append(hits, r)
+			}
+		}
+		if len(hits) == 1 {
+			return hits[0].RecordID, "备注", nil
+		}
+		if len(hits) > 1 {
+			// 同备注多条（同一笔采购多条明细、他复制了同样的备注）→ 用金额收敛
+			var narrowed []ledgerRowView
+			for _, r := range hits {
+				if sameMoney(r.Amount, ff.Amount()) {
+					narrowed = append(narrowed, r)
+				}
+			}
+			if len(narrowed) == 1 {
+				return narrowed[0].RecordID, "备注+金额", nil
+			}
+			return "", "", fmt.Errorf("备注「%s」匹配到 %d 条流水行（金额收敛后 %d 条），"+
+				"无法确定该覆盖哪一行 —— 请人工核对（登记单 %s）",
+				note, len(hits), len(narrowed), short(instanceCode))
+		}
+	}
+	// 备注没命中：用"金额 + 方向 + 还没登记过"兜底
+	var cands []ledgerRowView
+	for _, r := range rows {
+		if r.FlowID != "" && r.FlowID != "null" {
+			continue // 已经被别的登记单覆盖过
+		}
+		if !sameMoney(r.Amount, ff.Amount()) {
 			continue
 		}
-		if strings.Contains(string(raw), instanceCode) {
-			return recs[i].RecordID, nil
+		if ff.Kind != "" && r.Direction != "" && r.Direction != ff.Direction() {
+			continue
+		}
+		cands = append(cands, r)
+	}
+	if len(cands) == 1 {
+		return cands[0].RecordID, "金额", nil
+	}
+	return "", "", nil
+}
+
+// sameMoney 金额比较（分位容差）。
+func sameMoney(a, b float64) bool {
+	d := a - b
+	if d < 0 {
+		d = -d
+	}
+	return d < 0.011
+}
+
+// allLedgerRowsRegistered 判断"这笔采购的流水行是否都已经有登记单了"
+// （判据：流水行的「流水审批ID」非空 —— 覆盖时会写上去）。
+func allLedgerRowsRegistered(ctx context.Context, cfg *config.Config, c *feishu.Client,
+	appToken, tableID string, ledgerIDs []string) (bool, int, int, error) {
+
+	if len(ledgerIDs) == 0 {
+		return false, 0, 0, nil
+	}
+	rows, err := listLedgerRows(ctx, cfg, c, appToken, tableID)
+	if err != nil {
+		return false, 0, 0, err
+	}
+	byID := map[string]ledgerRowView{}
+	for _, r := range rows {
+		byID[r.RecordID] = r
+	}
+	done, total := 0, 0
+	for _, id := range ledgerIDs {
+		r, ok := byID[id]
+		if !ok {
+			continue // 行被人删了 → 不计入
+		}
+		total++
+		if strings.TrimSpace(r.FlowID) != "" && r.FlowID != "null" {
+			done++
 		}
 	}
-	return "", nil
+	return total > 0 && done == total, done, total, nil
 }
 
 // uploadScreenshotsToBitable 把登记单的转账截图（临时直链）转存成多维表格附件。
@@ -593,11 +777,12 @@ func uploadScreenshotsToBitable(ctx context.Context, c *feishu.Client, appToken 
 	return out, nil
 }
 
-// maybeCreateInvoiceForPurchase 在**该采购的全部流水登记单都已 applied** 之后
-// 给采购提交人开「27发票收集」（预填 + 各登记单的付款截图），并私信通知。
+// maybeCreateInvoiceForPurchase 在**该采购的流水行都登记过**之后，给采购提交人
+// 开「27发票收集」（预填 + 各登记单的付款截图），并私信通知。
 //
-// 为什么要等全部：发票单是按**整笔采购**开的（「名称」列是所有明细名），
-// 少一张登记单就开票，金额/截图都会缺。
+// 判据：流水行的「流水审批ID」都非空（覆盖时写上去的）——notify 模式下没有
+// 本地登记单映射，只能以表格为准。为什么要等全部：发票单是按**整笔采购**开的
+// （「名称」列是所有明细名），少一行就开票，金额/截图都会缺。
 func maybeCreateInvoiceForPurchase(ctx context.Context, cfg *config.Config, client *feishu.Client,
 	db *store.DB, purchaseCode string) error {
 
@@ -605,26 +790,25 @@ func maybeCreateInvoiceForPurchase(ctx context.Context, cfg *config.Config, clie
 	if err != nil {
 		return err
 	}
-	if ok && prev.InvoiceInstanceCode != "" {
+	if !ok {
+		return nil // 不是本服务写的采购（人工录的），不掺和
+	}
+	if prev.InvoiceInstanceCode != "" {
 		fmt.Printf("  = 发票单已代建过（%s），跳过\n", short(prev.InvoiceInstanceCode))
 		return nil
 	}
-	regs, err := db.FlowRegistersOfPurchase(ctx, purchaseCode)
+	flowBase, hasFlow := cfg.Base(config.BaseFlow)
+	ledgerTbl := cfg.Table(config.BaseFlow, "ledger")
+	if !hasFlow || ledgerTbl == "" {
+		return fmt.Errorf("配置缺少 flow base")
+	}
+	ready, done, total, err := allLedgerRowsRegistered(ctx, cfg, client,
+		flowBase.AppToken, ledgerTbl, prev.LedgerRecordIDs)
 	if err != nil {
 		return err
 	}
-	if len(regs) == 0 {
-		fmt.Println("  ⚠ 本地没有该采购的登记单留痕，无法判断是否登记完成 → 暂不开票")
-		return nil
-	}
-	pending := 0
-	for _, r := range regs {
-		if r.State != store.FlowRegisterApplied {
-			pending++
-		}
-	}
-	if pending > 0 {
-		fmt.Printf("  ⏳ 还有 %d/%d 张流水登记单未完成 → 暂不开票\n", pending, len(regs))
+	if !ready {
+		fmt.Printf("  ⏳ 还有 %d/%d 行流水没登记 → 暂不开票\n", total-done, total)
 		return nil
 	}
 
@@ -642,12 +826,29 @@ func maybeCreateInvoiceForPurchase(ctx context.Context, cfg *config.Config, clie
 	}
 	deptByName, _ := loadDepts(ctx, client, db, cfg)
 
-	// 各登记单的转账截图 → 上传到审批系统换 file code，作为发票单的「付款记录」
+	// 各登记单的转账截图 → 上传到审批系统换 file code，作为发票单的「付款记录」。
+	// 登记单 code 从流水行的「流水审批ID」里取。
+	rows, err := listLedgerRows(ctx, cfg, client, flowBase.AppToken, ledgerTbl)
+	if err != nil {
+		return err
+	}
+	byID := map[string]ledgerRowView{}
+	for _, r := range rows {
+		byID[r.RecordID] = r
+	}
 	var payTokens []string
-	for _, r := range regs {
-		rdet, _, err := client.GetInstanceDetail(ctx, r.InstanceCode)
+	for _, id := range prev.LedgerRecordIDs {
+		r, ok := byID[id]
+		if !ok {
+			continue
+		}
+		code := registerCodeFromFlowID(r.FlowID)
+		if code == "" {
+			continue
+		}
+		rdet, _, err := client.GetInstanceDetail(ctx, code)
 		if err != nil {
-			fmt.Printf("  ⚠ 读登记单 %s 失败（少一张付款截图）: %v\n", short(r.InstanceCode), err)
+			fmt.Printf("  ⚠ 读登记单 %s 失败（少一张付款截图）: %v\n", short(code), err)
 			continue
 		}
 		rws, err := feishu.ParseForm(rdet.Form)
@@ -657,7 +858,7 @@ func maybeCreateInvoiceForPurchase(ctx context.Context, cfg *config.Config, clie
 		rff := parseFlowForm(cfg, rws)
 		for i, u := range rff.Screenshots {
 			tok, err := downloadAndUploadApprovalFile(ctx, client, u,
-				fmt.Sprintf("付款截图-%s-%d", short(r.InstanceCode), i+1))
+				fmt.Sprintf("付款截图-%s-%d", short(code), i+1))
 			if err != nil {
 				fmt.Printf("  ⚠ 付款截图转审批文件失败: %v\n", err)
 				continue
@@ -668,7 +869,7 @@ func maybeCreateInvoiceForPurchase(ctx context.Context, cfg *config.Config, clie
 	if len(payTokens) > 0 {
 		fmt.Printf("  ✓ 付款截图 %d 张将预填进发票单\n", len(payTokens))
 	} else {
-		fmt.Println("  ⚠ 各登记单里没有转账截图，发票单的「付款记录」留空由提交人补")
+		fmt.Println("  ⚠ 登记单里没有转账截图，发票单的「付款记录」留空由提交人补")
 	}
 
 	invoiceCode, err := createInvoiceDraft(ctx, cfg, client, db, deptByName, inv.Code, info, payTokens)
@@ -683,8 +884,8 @@ func maybeCreateInvoiceForPurchase(ctx context.Context, cfg *config.Config, clie
 		})
 		return fmt.Errorf("代建发票单失败: %w", err)
 	}
-	fmt.Printf("  ✓ 已代建发票单 %s 并退回发起人（全部 %d 张登记单已完成）\n",
-		short(invoiceCode), len(regs))
+	fmt.Printf("  ✓ 已代建发票单 %s 并退回发起人（%d/%d 行流水已登记）\n",
+		short(invoiceCode), done, total)
 	_ = db.UpsertPurchase(ctx, store.PurchaseSync{
 		PurchaseInstanceCode: purchaseCode, ApprovalCode: info.ApprovalCode,
 		ApplicantUserID: info.ApplicantID, PurchaseStatus: info.Status,
@@ -695,6 +896,37 @@ func maybeCreateInvoiceForPurchase(ctx context.Context, cfg *config.Config, clie
 	})
 	_ = notifyApplicant(ctx, cfg, client, info, invoiceCode)
 	return nil
+}
+
+// registerCodeFromFlowID 从流水行「流水审批ID」的值里取出登记单实例 code。
+// 值形态是 [{"link":"...instanceId=<code>","text":"查看流水登记"}]。
+func registerCodeFromFlowID(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	// 优先从 applink 的 instanceId= 参数取
+	for _, sep := range []string{"instanceId%3D", "instanceId="} {
+		if i := strings.Index(raw, sep); i >= 0 {
+			rest := raw[i+len(sep):]
+			if j := strings.IndexAny(rest, "&\"\\"); j >= 0 {
+				rest = rest[:j]
+			}
+			if len(rest) >= 8 {
+				return rest
+			}
+		}
+	}
+	// 兜底：值里直接是实例 code（36 位 UUID）
+	var m []string
+	for _, seg := range strings.Split(raw, "\"") {
+		if len(seg) == 36 && strings.Count(seg, "-") == 4 {
+			m = append(m, seg)
+		}
+	}
+	if len(m) > 0 {
+		return m[0]
+	}
+	return ""
 }
 
 // downloadAndUploadApprovalFile 下载临时直链 → 上传到审批系统 → 返回 file code。

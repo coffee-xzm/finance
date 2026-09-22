@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,6 +45,16 @@ func main() {
 	purchaseGroup := flag.String("purchase-group", "视觉组", "-create-purchase 的项目组")
 	purchaseAmounts := flag.String("purchase-amounts", "12.5,7", "-create-purchase 的各条明细单价（逗号分隔）")
 	purchaseQtys := flag.String("purchase-qtys", "2,1", "-create-purchase 的各条明细数量（逗号分隔）")
+	createReg := flag.Bool("create-register", false,
+		"★写：创建一张「27-流水登记」测试实例（用于联调 notify→覆盖流水→开票 全链路）")
+	regKind := flag.String("reg-kind", "支出", "-create-register 的类型：转入/支出")
+	regAmount := flag.String("reg-amount", "0", "-create-register 的金额")
+	regNote := flag.String("reg-note", "", "-create-register 的备注（★ 要与流水行备注一致，系统靠它认行）")
+	regSource := flag.String("reg-source", "", "-create-register 的金额来源")
+	regDest := flag.String("reg-dest", "", "-create-register 的金额去向")
+	regShot := flag.String("reg-screenshot", "", "-create-register 的转账截图文件路径（可选）")
+	regDate := flag.String("reg-date", "", "-create-register 的转账日期 YYYY-MM-DD（默认今天）")
+	regUser := flag.String("reg-user", "", "-create-register 的提交人 user_id（默认 flow_register.user_id）")
 	approve := flag.String("approve", "", "★写：同意该实例的全部 PENDING 任务")
 	rollback := flag.String("rollback", "", "★写：把该实例退回到 START（发起人）")
 	user := flag.String("user", "", "提交人 user_id（默认 config.feishu.admin_user_id）")
@@ -114,6 +125,14 @@ func main() {
 		return
 	case *createPurchase:
 		runCreatePurchase(ctx, cfg, c, *user, *purchaseGroup, *purchaseAmounts, *purchaseQtys, *uuid)
+		return
+	case *createReg:
+		u := *regUser
+		if u == "" {
+			u = cfg.RegisterUserID()
+		}
+		runCreateRegister(ctx, cfg, c, u, *regKind, *regAmount, *regNote,
+			*regSource, *regDest, *regShot, *regDate, *uuid)
 		return
 	case *approve != "":
 		runApprove(ctx, c, *approve)
@@ -240,6 +259,72 @@ func runCreatePurchase(ctx context.Context, cfg *config.Config, c *feishu.Client
 	fmt.Printf("✓ 已创建采购审批测试实例 %s（提交人=%s，项目组=%s，%d 条明细）\n",
 		newCode, user, group, len(amts))
 	fmt.Printf("  下一步：go run ./cmd/approvalprobe -approve %s\n", newCode)
+}
+
+// runCreateRegister 建一张「27-流水登记」测试实例。
+//
+// 用途：这个审批的节点是「自动通过」，用 API 建单即 APPROVED —— 正好可以拿来
+// 端到端验证"登记单通过 → 覆盖流水行 → 全部登记完开票"（见 docs/33 §12.15）。
+// 备注必须与流水行的备注逐字一致，系统靠它把登记数据匹配回那一行。
+func runCreateRegister(ctx context.Context, cfg *config.Config, c *feishu.Client,
+	user, kind, amount, note, source, dest, shot, date, uuid string) {
+
+	appr, ok := cfg.ApprovalByRole(config.RoleLedgerRegister)
+	if !ok || appr.Code == "" {
+		die(fmt.Errorf("config 里没有 role=ledger_register 的审批"))
+	}
+	if uuid == "" {
+		uuid = "probe-register-" + time.Now().Format("20060102T150405")
+	}
+	ctrl := func(k string) string { return cfg.Control(config.RoleLedgerRegister, k) }
+	amt, _ := strconv.ParseFloat(strings.TrimSpace(amount), 64)
+	if date == "" {
+		date = time.Now().Format("2006-01-02")
+	}
+	form := []map[string]any{}
+	if v := cfg.OptionValue(config.RoleLedgerRegister, "类型", kind); v != "" {
+		form = append(form, map[string]any{"id": ctrl("kind"), "type": "radioV2", "value": v})
+	}
+	if kind == "转入" {
+		form = append(form, map[string]any{"id": ctrl("transfer_amount"), "type": "amount",
+			"value": amt, "currency": "CNY"})
+	} else {
+		form = append(form, map[string]any{"id": ctrl("expense_amount"), "type": "amount",
+			"value": amt, "currency": "CNY"})
+	}
+	if t, err := time.ParseInLocation("2006-01-02", date, time.Local); err == nil {
+		form = append(form, map[string]any{"id": ctrl("date"), "type": "date", "value": t.Format(time.RFC3339)})
+	}
+	if note != "" {
+		form = append(form, map[string]any{"id": ctrl("note"), "type": "textarea", "value": note})
+	}
+	if v := cfg.OptionValue(config.RoleLedgerRegister, "金额来源", source); source != "" && v != "" {
+		form = append(form, map[string]any{"id": ctrl("source"), "type": "radioV2", "value": v})
+	}
+	if v := cfg.OptionValue(config.RoleLedgerRegister, "金额去向", dest); dest != "" && v != "" {
+		form = append(form, map[string]any{"id": ctrl("destination"), "type": "radioV2", "value": v})
+	}
+	if shot != "" {
+		data, err := os.ReadFile(shot)
+		if err != nil {
+			die(fmt.Errorf("读截图失败: %w", err))
+		}
+		name := filepath.Base(shot)
+		code, err := c.UploadApprovalFile(ctx, name, "attachment", data)
+		if err != nil {
+			die(fmt.Errorf("上传截图到审批失败: %w", err))
+		}
+		fmt.Printf("  截图已上传审批：%s（%s）\n", name, code)
+		form = append(form, map[string]any{"id": ctrl("screenshot"), "type": "attachmentV2",
+			"value": []string{code}})
+	}
+	newCode, err := c.CreateInstance(ctx, feishu.CreateInstanceRequest{
+		ApprovalCode: appr.Code, UserID: user, Form: form, UUID: uuid, AllowResubmit: true,
+	})
+	if err != nil {
+		die(err)
+	}
+	fmt.Printf("✓ 已创建流水登记实例 %s（提交人=%s 类型=%s 金额=%s）\n", newCode, user, kind, amount)
 }
 
 // splitFloats 解析 "12.5,7" 这样的数字列表。

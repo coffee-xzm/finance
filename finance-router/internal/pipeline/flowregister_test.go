@@ -3,6 +3,7 @@ package pipeline
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -215,4 +216,100 @@ func TestOptionTextFallback(t *testing.T) {
 func mustJSON(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+// TestPickLedgerRow 认行口径（notify 模式的核心）：备注优先、金额兜底、
+// 命中多条**报错而不是随便挑**。
+func TestPickLedgerRow(t *testing.T) {
+	rows := []ledgerRowView{
+		{RecordID: "row1", Note: "耗材 ｜ 焊锡 ×2", Amount: 62.9, Direction: "支出"},
+		{RecordID: "row2", Note: "耗材 ｜ 洗板水 ×1", Amount: 27.6, Direction: "支出"},
+		{RecordID: "row3", Note: "已登记过的行", Amount: 5, Direction: "支出", FlowID: `[{"link":"x"}]`},
+	}
+	// ① 备注精确命中
+	if id, how, err := pickLedgerRow(rows, &flowForm{Kind: "支出", Expense: 62.9, Note: "耗材 ｜ 焊锡 ×2"}, ""); err != nil || id != "row1" || how != "备注" {
+		t.Errorf("备注命中失败: %s %s %v", id, how, err)
+	}
+	// ② 备注带空白也应命中（登记人手抖多打个空格）
+	if id, _, err := pickLedgerRow(rows, &flowForm{Kind: "支出", Expense: 27.6, Note: "  耗材 ｜ 洗板水 ×1  "}, ""); err != nil || id != "row2" {
+		t.Errorf("备注去空白后应命中 row2，实际 %s %v", id, err)
+	}
+	// ③ 备注改了（没命中）→ 用金额兜底
+	if id, how, err := pickLedgerRow(rows, &flowForm{Kind: "支出", Expense: 27.6, Note: "我改过备注"}, ""); err != nil || id != "row2" || how != "金额" {
+		t.Errorf("金额兜底失败: %s %s %v", id, how, err)
+	}
+	// ④ 已经登记过的行不能被金额兜底再匹配一次
+	if id, _, err := pickLedgerRow(rows, &flowForm{Kind: "支出", Expense: 5, Note: ""}, ""); err != nil || id != "" {
+		t.Errorf("已登记的行不该再被匹配: %s %v", id, err)
+	}
+	// ⑤ 同备注多条 + 金额也分不开 → 报错（宁可不写，也不要把钱记错行）
+	dup := []ledgerRowView{
+		{RecordID: "a", Note: "同一句备注", Amount: 10, Direction: "支出"},
+		{RecordID: "b", Note: "同一句备注", Amount: 10, Direction: "支出"},
+	}
+	if _, _, err := pickLedgerRow(dup, &flowForm{Kind: "支出", Expense: 10, Note: "同一句备注"}, "REG-1"); err == nil {
+		t.Error("同备注同金额多条时应报错而不是猜")
+	}
+	// ⑥ 同备注多条但金额不同 → 金额能收敛，选那一行
+	dup2 := []ledgerRowView{
+		{RecordID: "a", Note: "同一句备注", Amount: 10, Direction: "支出"},
+		{RecordID: "b", Note: "同一句备注", Amount: 12, Direction: "支出"},
+	}
+	if id, how, err := pickLedgerRow(dup2, &flowForm{Kind: "支出", Expense: 12, Note: "同一句备注"}, ""); err != nil || id != "b" || how != "备注+金额" {
+		t.Errorf("备注+金额收敛失败: %s %s %v", id, how, err)
+	}
+	// ⑦ 流水审批ID 里已经有这张登记单 → 直接命中（事件重放）
+	rows2 := []ledgerRowView{{RecordID: "r", FlowID: `[{"link":"...instanceId%3DABC-123"}]`}}
+	if id, how, _ := pickLedgerRow(rows2, &flowForm{}, "ABC-123"); id != "r" || how != "流水审批ID" {
+		t.Errorf("按流水审批ID命中失败: %s %s", id, how)
+	}
+}
+
+// TestRegisterCodeFromFlowID 从「流水审批ID」的值里取回登记单 code。
+func TestRegisterCodeFromFlowID(t *testing.T) {
+	link := `[{"link":"https://applink.feishu.cn/client/mini_program/open?mode=appCenter&path=pc%2Fpages%2Fin-process%2Findex%3FinstanceId%3D4A4EDC04-F04B-4056-8A2A-95C0D007BE50","text":"查看流水登记"}]`
+	if got := registerCodeFromFlowID(link); got != "4A4EDC04-F04B-4056-8A2A-95C0D007BE50" {
+		t.Errorf("registerCodeFromFlowID = %q", got)
+	}
+	if got := registerCodeFromFlowID(""); got != "" {
+		t.Errorf("空值应为空串，实际 %q", got)
+	}
+}
+
+// TestBuildRegisterNotice 私信正文必须带上"要照抄的备注"（那是后面认行的键）。
+func TestBuildRegisterNotice(t *testing.T) {
+	cfg := flowCfg()
+	info := &purchaseInfo{
+		InstanceCode: "P-1", ProjectName: "耗材（接口焊锡洗板水）",
+		Items: []purchaseItem{{Name: "焊锡", Qty: 2, Amount: 31.45}, {Name: "洗板水", Qty: 1, Amount: 27.6}},
+	}
+	text := buildRegisterNotice(cfg, info)
+	for _, want := range []string{
+		"采购审批「耗材（接口焊锡洗板水）」已通过，请为下面 2 笔流水各发一张「27-流水登记」",
+		"1. 焊锡　金额 62.90（31.45 × 2）",
+		"备注请照抄：耗材（接口焊锡洗板水） ｜ 焊锡 ×2",
+		"2. 洗板水　金额 27.60（27.6 × 1）",
+		"备注请照抄：耗材（接口焊锡洗板水） ｜ 洗板水 ×1",
+		"类型选「支出」",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("私信正文缺少 %q：\n%s", want, text)
+		}
+	}
+}
+
+// TestDraftStateFor draft_state 是补漏扫描的幂等锚点，口径不能含糊。
+func TestDraftStateFor(t *testing.T) {
+	if got := draftStateFor("notify", "", ""); got != "awaiting_register" {
+		t.Errorf("notify 成功应为 awaiting_register，实际 %q", got)
+	}
+	if got := draftStateFor("notify", "", "230013"); got != "failed" {
+		t.Errorf("私信失败应记 failed（好让补漏重试），实际 %q", got)
+	}
+	if got := draftStateFor("draft", "", ""); got != "awaiting_applicant" {
+		t.Errorf("draft 模式应为 awaiting_applicant，实际 %q", got)
+	}
+	if got := draftStateFor("", "INV-1", ""); got != "awaiting_applicant" {
+		t.Errorf("旧流程（直接开票）应为 awaiting_applicant，实际 %q", got)
+	}
 }
