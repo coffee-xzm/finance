@@ -298,6 +298,34 @@ func TestBuildRegisterNotice(t *testing.T) {
 	}
 }
 
+// TestBuildRegisterDraftNotice draft 模式私信：一句结论 + 每张单一行 + 一行"补什么"。
+func TestBuildRegisterDraftNotice(t *testing.T) {
+	cfg := flowCfg()
+	info := &purchaseInfo{
+		InstanceCode: "P-1", ProjectName: "耗材",
+		Items: []purchaseItem{{Name: "焊锡", Qty: 2, Amount: 31.45}, {Name: "洗板水", Qty: 1, Amount: 27.6}},
+	}
+	text := buildRegisterDraftNotice(cfg, info, []string{"REG-1", "REG-2"})
+	for _, want := range []string{
+		"已通过，代建了 2 张「27-流水登记」待你补齐",
+		"1. 焊锡（62.90）",
+		"2. 洗板水（27.60）",
+		"补：转账日期 / 转账截图 / 金额来源 / 金额去向",
+		"全部明细登记完后自动开「27发票收集」",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("draft 私信缺少 %q：\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "提交即通过") {
+		t.Error("draft 模式有审批人，不该再说「提交即通过」")
+	}
+	// 预览（还没有登记单 code）时不 panic，用占位说明
+	if got := buildRegisterDraftNotice(cfg, info, make([]string, 2)); !strings.Contains(got, "代建后这里是登记单链接") {
+		t.Errorf("无 code 时应有占位说明：\n%s", got)
+	}
+}
+
 // TestDraftStateFor draft_state 是补漏扫描的幂等锚点，口径不能含糊。
 func TestDraftStateFor(t *testing.T) {
 	if got := draftStateFor("notify", "", ""); got != "awaiting_register" {
@@ -320,20 +348,23 @@ func TestDefinitionNeedsApprover(t *testing.T) {
 		t.Error("nil 定义应视为没有审批人")
 	}
 	// 实测「27-流水登记」：只有 发起/结束（都不需要审批人）→ 建单即自动通过、撤回报 10112
+	// 改定义**之前**的实测结构：只有 发起/结束 → 建单即 APPROVED、撤回报 10112
 	autoPass := &feishu.ApprovalDefinition{NodeList: []feishu.Node{
-		{Name: "发起", NodeType: "AND", NeedApprover: false},
-		{Name: "结束", NodeType: "AND", NeedApprover: false},
+		{Name: "发起", NodeType: "AND"},
+		{Name: "结束", NodeType: "AND"},
 	}}
 	if definitionNeedsApprover(autoPass) {
 		t.Error("只有发起/结束的定义应判定为没有审批人")
 	}
-	// 有真实审批人 → 可以走"代建预填 + 退回发起"
+	// 改定义**之后**的实测结构：[审批, 结束, 发起] → 建单后 PENDING，任务在审批人手上。
+	// ★ 注意 need_approver 在本租户恒为 false（连有真实审批人的 27发票收集 也是 false），
+	//   所以判据只能是"节点名"，这里刻意把 NeedApprover 写成 false 来锁住这一点。
 	withApprover := &feishu.ApprovalDefinition{NodeList: []feishu.Node{
-		{Name: "发起", NeedApprover: false},
-		{Name: "审批", NodeType: "AND", NeedApprover: true},
-		{Name: "结束", NeedApprover: false},
+		{Name: "审批", NodeType: "AND", NeedApprover: false},
+		{Name: "结束", NodeType: "AND", NeedApprover: false},
+		{Name: "发起", NodeType: "AND", NeedApprover: false},
 	}}
 	if !definitionNeedsApprover(withApprover) {
-		t.Error("有 need_approver 节点时应判定为可以代建后撤回")
+		t.Error("有「审批」节点时应判定为可以代建后撤回（不能依赖 need_approver）")
 	}
 }

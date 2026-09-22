@@ -324,20 +324,34 @@ func notifyRegistrant(ctx context.Context, cfg *config.Config, client *feishu.Cl
 	if userID == "" {
 		return fmt.Errorf("config 缺 flow_register.user_id，无法通知登记人")
 	}
+	text := buildRegisterDraftNotice(cfg, info, codes)
+	return sendWithAdminFallback(ctx, cfg, client, userID, text,
+		fmt.Sprintf("采购「%s」的代建流水登记单已创建", info.ProjectName))
+}
+
+// buildRegisterDraftNotice 是 draft 模式（代建预填单 + 退回发起）发给登记人的正文。
+//
+// 要短：一句结论 + 每张单一行（明细名/金额 + 链接）+ 一行"补什么"。
+// 链接是必需的（他可能在手机飞书里点开就要填）。
+func buildRegisterDraftNotice(cfg *config.Config, info *purchaseInfo, codes []string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "【流水登记】采购审批「%s」已通过，已为你代建 %d 张「27-流水登记」：\n",
+	fmt.Fprintf(&b, "【流水登记】采购审批「%s」已通过，代建了 %d 张「27-流水登记」待你补齐：\n",
 		info.ProjectName, len(codes))
 	for i, c := range codes {
-		name := ""
-		if i < len(itemNames) {
-			name = itemNames[i]
+		name, amt := "", 0.0
+		if i < len(info.Items) {
+			name, amt = info.Items[i].Name, ledgerAmount(info.Items[i])
 		}
-		fmt.Fprintf(&b, "\n%d. %s\n%s", i+1, name, buildApprovalApplink(cfg, c))
+		fmt.Fprintf(&b, "%d. %s（%.2f）\n", i+1, name, amt)
+		if c != "" {
+			fmt.Fprintf(&b, "   %s\n", buildApprovalApplink(cfg, c))
+		} else {
+			b.WriteString("   （代建后这里是登记单链接）\n")
+		}
 	}
-	b.WriteString("\n\n请核对/补齐（转账日期、金额、截图、金额来源/去向）后提交；" +
-		"提交即通过，之后系统会给采购提交人开「27发票收集」。")
-	return sendWithAdminFallback(ctx, cfg, client, userID, b.String(),
-		fmt.Sprintf("采购「%s」的代建流水登记单已创建", info.ProjectName))
+	b.WriteString("补：转账日期 / 转账截图 / 金额来源 / 金额去向。提交后在审批里通过 → " +
+		"系统按登记数据覆盖「27 - 收支表」对应行，全部明细登记完后自动开「27发票收集」。")
+	return b.String()
 }
 
 // notifyPendingRegister 是 notify 模式的核心动作：**不代建审批**，只把待登记内容
@@ -389,14 +403,21 @@ func buildRegisterNotice(cfg *config.Config, info *purchaseInfo) string {
 // 而"自动通过"节点执行完没有任何归属人的任务 —— 实测回退报
 // `10112 no permission over task`。所以定义里没有 need_approver 的节点时，
 // 只能走"私信 + 人工发起"。
+// ⚠ 不能用返回里的 `need_approver`：本租户实测**所有节点恒为 false**
+// （连 27发票收集 那种有真实审批人的定义也是 false）。真正可靠的是**节点结构**：
+// 「自动通过」节点不会出现在 node_list 里，只有真实处理节点（审批/或签/会签…）才会。
+// 实测对照：改定义前 node_list = [结束, 发起]（建单即通过）；改定义后 = [审批, 结束, 发起]
+// （建单后是 PENDING，任务在审批人手上）。
 func definitionNeedsApprover(def *feishu.ApprovalDefinition) bool {
 	if def == nil {
 		return false
 	}
 	for _, n := range def.NodeList {
-		if n.NeedApprover {
-			return true
+		switch strings.TrimSpace(n.Name) {
+		case "", "发起", "提交", "结束", "抄送", "抄送人":
+			continue // 结构性节点，不需要人审批
 		}
+		return true // 剩下的就是真实处理节点
 	}
 	return false
 }
@@ -436,7 +457,18 @@ func PreviewRegisterNotice(ctx context.Context, cfg *config.Config, instanceCode
 	if err != nil {
 		return "", err
 	}
-	return buildRegisterNotice(cfg, info), nil
+	mode, why := ResolveRegisterMode(ctx, cfg, client)
+	var b strings.Builder
+	fmt.Fprintf(&b, "流水登记模式 = %s（%s）\n\n", mode, why)
+	switch mode {
+	case "draft":
+		b.WriteString("── draft：代建预填单并退回发起后，发给登记人的私信 ──\n")
+		b.WriteString(buildRegisterDraftNotice(cfg, info, make([]string, len(info.Items))))
+	default:
+		b.WriteString("── notify：采购通过后，发给登记人的私信 ──\n")
+		b.WriteString(buildRegisterNotice(cfg, info))
+	}
+	return b.String(), nil
 }
 
 // trimNum 打印数量/单价时不带多余小数位。

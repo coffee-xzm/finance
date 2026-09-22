@@ -55,6 +55,7 @@ func main() {
 	regShot := flag.String("reg-screenshot", "", "-create-register 的转账截图文件路径（可选）")
 	regDate := flag.String("reg-date", "", "-create-register 的转账日期 YYYY-MM-DD（默认今天）")
 	regUser := flag.String("reg-user", "", "-create-register 的提交人 user_id（默认 flow_register.user_id）")
+	cancelInstance := flag.String("cancel", "", "★写：撤回一条审批实例（清理试探单；只能撤还在审批中的）")
 	approve := flag.String("approve", "", "★写：同意该实例的全部 PENDING 任务")
 	rollback := flag.String("rollback", "", "★写：把该实例退回到 START（发起人）")
 	user := flag.String("user", "", "提交人 user_id（默认 config.feishu.admin_user_id）")
@@ -133,6 +134,12 @@ func main() {
 		}
 		runCreateRegister(ctx, cfg, c, u, *regKind, *regAmount, *regNote,
 			*regSource, *regDest, *regShot, *regDate, *uuid)
+		return
+	case *cancelInstance != "":
+		if err := c.CancelInstance(ctx, *code, *cancelInstance, *user); err != nil {
+			die(err)
+		}
+		fmt.Printf("✓ 已撤回实例 %s（user_id=%s）\n", *cancelInstance, *user)
 		return
 	case *approve != "":
 		runApprove(ctx, c, *approve)

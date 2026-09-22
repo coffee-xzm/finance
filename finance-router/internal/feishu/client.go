@@ -1149,6 +1149,24 @@ func (c *Client) UploadMedia(ctx context.Context, appToken, parentType, fileName
 		})
 }
 
+// CancelInstance 撤回一条审批实例（只有发起人能撤、且实例得还在"审批中"）。
+//
+// 用途：清理试探/作废的实例（例如"自动通过"时期建出来的空登记单）。
+// 已通过/已拒绝的实例撤回不了 —— 这时只能人工忽略。
+func (c *Client) CancelInstance(ctx context.Context, approvalCode, instanceCode, userID string) error {
+	q := url.Values{}
+	q.Set("user_id_type", "user_id")
+	body := map[string]any{
+		"instance_code": instanceCode,
+		"user_id":       userID,
+	}
+	if approvalCode != "" {
+		body["approval_code"] = approvalCode
+	}
+	_, err := c.post(ctx, "/approval/v4/instances/cancel?"+q.Encode(), body)
+	return err
+}
+
 // UploadApprovalFile 把文件上传到**审批系统**，返回可用于创建审批实例的 file code。
 //
 // 为什么不能复用「27-流水登记」里的附件：审批实例详情里的附件值是**带 authcode 的
