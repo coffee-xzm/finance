@@ -325,8 +325,12 @@ func notifyRegistrant(ctx context.Context, cfg *config.Config, client *feishu.Cl
 		return fmt.Errorf("config 缺 flow_register.user_id，无法通知登记人")
 	}
 	text := buildRegisterDraftNotice(cfg, info, codes)
-	return sendWithAdminFallback(ctx, cfg, client, userID, text,
-		fmt.Sprintf("采购「%s」的代建流水登记单已创建", info.ProjectName))
+	if err := sendWithAdminFallback(ctx, cfg, client, userID, text,
+		fmt.Sprintf("采购「%s」的代建流水登记单已创建", info.ProjectName)); err != nil {
+		return err
+	}
+	fmt.Printf("  ✓ 已私信登记人 %s：%d 张流水登记单待补\n", userID, len(codes))
+	return nil
 }
 
 // buildRegisterDraftNotice 是 draft 模式（代建预填单 + 退回发起）发给登记人的正文。
