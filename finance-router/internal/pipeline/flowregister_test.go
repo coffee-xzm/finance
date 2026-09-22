@@ -313,3 +313,27 @@ func TestDraftStateFor(t *testing.T) {
 		t.Errorf("旧流程（直接开票）应为 awaiting_applicant，实际 %q", got)
 	}
 }
+
+// TestDefinitionNeedsApprover 「能不能代建后撤回」的判据：定义里有没有真实审批人节点。
+func TestDefinitionNeedsApprover(t *testing.T) {
+	if definitionNeedsApprover(nil) {
+		t.Error("nil 定义应视为没有审批人")
+	}
+	// 实测「27-流水登记」：只有 发起/结束（都不需要审批人）→ 建单即自动通过、撤回报 10112
+	autoPass := &feishu.ApprovalDefinition{NodeList: []feishu.Node{
+		{Name: "发起", NodeType: "AND", NeedApprover: false},
+		{Name: "结束", NodeType: "AND", NeedApprover: false},
+	}}
+	if definitionNeedsApprover(autoPass) {
+		t.Error("只有发起/结束的定义应判定为没有审批人")
+	}
+	// 有真实审批人 → 可以走"代建预填 + 退回发起"
+	withApprover := &feishu.ApprovalDefinition{NodeList: []feishu.Node{
+		{Name: "发起", NeedApprover: false},
+		{Name: "审批", NodeType: "AND", NeedApprover: true},
+		{Name: "结束", NeedApprover: false},
+	}}
+	if !definitionNeedsApprover(withApprover) {
+		t.Error("有 need_approver 节点时应判定为可以代建后撤回")
+	}
+}

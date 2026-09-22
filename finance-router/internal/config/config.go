@@ -66,24 +66,25 @@ type FlowRegister struct {
 	// Disabled 置 true 时退回旧流程（采购通过直接给提交人开票），用于应急。
 	Disabled bool `yaml:"disabled"`
 	// Mode 决定"采购通过后怎么把流水交给登记人"：
-	//   notify（默认）= **不代建审批**，只把待登记内容私信给登记人，由他自己开
-	//                  「27-流水登记」；提交即通过后系统按备注/金额匹配到流水行并覆盖。
-	//   draft          = 代建预填好的登记单并"退回到发起"（要求该审批有**真实审批人**：
-	//                  节点是"自动通过"时建单即 APPROVED，没有待办可退回 —— 实测 10112）。
-	// 用户 2026-09-22 选定 notify。
+	//   auto（默认）= 看审批定义自动选：有**真实审批人节点** → draft；只有"自动通过"
+	//                  → notify。定义改好了自动切回来，不用改配置。
+	//   draft        = 代建预填好的登记单并"退回到发起"，人工补全后提交、审批人通过
+	//                  （要求该审批有真实审批人：节点是"自动通过"时建单即 APPROVED，
+	//                   没有待办可退回 —— 实测 10112 no permission over task）。
+	//   notify       = 不代建审批，只私信登记人待登记内容，由他自己开「27-流水登记」；
+	//                  提交即通过后系统按备注/金额匹配到流水行并覆盖。
+	//   off          = 不做流水登记这一步（等于旧流程）
 	Mode string `yaml:"mode"`
 }
 
 // RegisterUserID 返回登记人 user_id（未配置则空）。
 func (c *Config) RegisterUserID() string { return c.FlowRegister.UserID }
 
-// RegisterMode 归一化后的模式："" / off / draft / notify。
-//
-// 未配置时取 notify（用户 2026-09-22 定：该审批没有审批人，代建后无法退回到发起）。
+// RegisterMode 归一化后的模式：auto / off / draft / notify（未配置 = auto）。
 func (c *Config) RegisterMode() string {
 	m := strings.ToLower(strings.TrimSpace(c.FlowRegister.Mode))
 	if m == "" {
-		return "notify"
+		return "auto"
 	}
 	return m
 }

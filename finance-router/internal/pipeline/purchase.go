@@ -251,9 +251,12 @@ func RunPurchase(ctx context.Context, opts PurchaseOptions) error {
 	invoiceCode := ""
 	registerNotifyErr := ""
 	registerAppr, hasRegister := cfg.ApprovalByRole(config.RoleLedgerRegister)
-	mode := cfg.RegisterMode()
+	mode, modeWhy := ResolveRegisterMode(ctx, cfg, client)
 	useRegister := hasRegister && registerAppr.Code != "" && cfg.RegisterUserID() != "" &&
 		!cfg.FlowRegister.Disabled && mode != "off"
+	if useRegister && !opts.DryRun {
+		fmt.Printf("  流水登记模式 = %s（%s）\n", mode, modeWhy)
+	}
 	switch {
 	case useRegister && mode == "notify":
 		// 只发私信：登记人自己开单，提交即通过 → 事件回来时按备注/金额匹配流水行

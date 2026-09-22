@@ -281,6 +281,12 @@ func main() {
 				// 若管理员已在审批后台订阅过，事件仍会到达。
 				fmt.Printf("⚠ [%s] 订阅调用失败（若已在审批后台订阅过可忽略）: %v\n", a.Role, err)
 			}
+			// 「27-流水登记」这一步是走"代建预填+撤回"还是"私信让登记人自己开单"，
+			// 由审批定义决定（有没有真实审批人节点）。启动时先说清，省得事后猜。
+			if a.Role == config.RoleLedgerRegister {
+				m, why := pipeline.ResolveRegisterMode(ctx, s.cfg, s.client)
+				fmt.Printf("           流水登记模式 = %s（%s）\n", m, why)
+			}
 		}
 	}
 

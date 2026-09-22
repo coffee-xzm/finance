@@ -382,6 +382,48 @@ func buildRegisterNotice(cfg *config.Config, info *purchaseInfo) string {
 	return b.String()
 }
 
+// definitionNeedsApprover 判断审批定义里是否存在**真实审批人节点**。
+//
+// 这是"能不能用 prefill+rollback 那条路"的硬前提：撤回（specified_rollback）是
+// **任务级**操作、必须以用户身份对某个具体 task 执行（官方：退回审批任务），
+// 而"自动通过"节点执行完没有任何归属人的任务 —— 实测回退报
+// `10112 no permission over task`。所以定义里没有 need_approver 的节点时，
+// 只能走"私信 + 人工发起"。
+func definitionNeedsApprover(def *feishu.ApprovalDefinition) bool {
+	if def == nil {
+		return false
+	}
+	for _, n := range def.NodeList {
+		if n.NeedApprover {
+			return true
+		}
+	}
+	return false
+}
+
+// ResolveRegisterMode 把 auto 解析成 draft / notify，并给出人可读的理由。
+//
+// 解析失败（读不到定义）时**保守选 notify**：宁可让登记人自己开单，
+// 也不要建出一堆"建完就自动通过、没人能改"的作废单。
+func ResolveRegisterMode(ctx context.Context, cfg *config.Config, client *feishu.Client) (mode, why string) {
+	switch m := cfg.RegisterMode(); m {
+	case "draft", "notify", "off":
+		return m, "配置指定"
+	}
+	appr, ok := cfg.ApprovalByRole(config.RoleLedgerRegister)
+	if !ok || appr.Code == "" {
+		return "off", "没配 role=ledger_register 的审批"
+	}
+	def, err := client.GetApprovalDefinition(ctx, appr.Code)
+	if err != nil {
+		return "notify", "读审批定义失败（保守按 notify）: " + err.Error()
+	}
+	if definitionNeedsApprover(def) {
+		return "draft", "审批定义里有真实审批人节点 → 可以代建后撤回给登记人补全"
+	}
+	return "notify", "审批定义里没有真实审批人节点（节点是自动通过，撤回不了）→ 只能私信登记人自己开单"
+}
+
 // PreviewRegisterNotice 只读预览：notify 模式下会发给登记人的那段文字
 // （运维入口 cmd/purchase -notice <采购实例code>，用来核对格式/重发前看一眼）。
 func PreviewRegisterNotice(ctx context.Context, cfg *config.Config, instanceCode string) (string, error) {

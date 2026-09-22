@@ -59,6 +59,9 @@ func TestDictDefaults(t *testing.T) {
 	if got := c.OptionValue(RoleLedgerRegister, "类型", "支出"); got == "" {
 		t.Error("ledger_register 类型=支出 的选项 value 缺失")
 	}
+	if got := (&Config{}).RegisterMode(); got != "auto" {
+		t.Errorf("flow_register.mode 未配置时应为 auto（看定义自动选 draft/notify），实际 %q", got)
+	}
 	if c.Field("ledger", "flow_id") != "流水审批ID" {
 		t.Errorf("ledger.flow_id = %q，应为「流水审批ID」（主字段，登记单幂等锚点）", c.Field("ledger", "flow_id"))
 	}
