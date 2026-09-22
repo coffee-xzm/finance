@@ -423,8 +423,21 @@ func RunPurchase(ctx context.Context, opts PurchaseOptions) error {
 			return fmt.Errorf("写本地采购记录失败: %w", err)
 		}
 	}
-	fmt.Printf("✓ 采购 %s 处理完成（流水 %d 行，流水登记 %d 张，发票单 %s）\n",
-		short(info.InstanceCode), len(ledgerIDs), len(registerCodes), short(invoiceCode))
+	regDesc := "—"
+	switch {
+	case useRegister && mode == "notify":
+		regDesc = fmt.Sprintf("待登记 %d 笔", len(info.Items))
+	case useRegister:
+		n := 0
+		for _, c := range registerCodes {
+			if c != "" {
+				n++
+			}
+		}
+		regDesc = fmt.Sprintf("流水登记 %d 张", n)
+	}
+	fmt.Printf("✓ 采购 %s 处理完成（流水 %d 行，%s，发票单 %s）\n",
+		short(info.InstanceCode), len(ledgerIDs), regDesc, short(invoiceCode))
 	return nil
 }
 

@@ -711,6 +711,11 @@ func (s *service) handleOtherEvent(ctx context.Context, eventType string, base *
 		return nil
 	}
 
+	// ★ 有些事件（实测 approval_task 的 v2 事件）**不带 event_id**，而留痕表用
+	//   event_id 做幂等键 —— 硬写只会刷一行"留痕失败"，噪音盖住真问题。直接跳过。
+	if eventID == "" {
+		return nil
+	}
 	res, first, err := s.db.RecordEvent(ctx, store.Event{
 		EventID: eventID, EventType: eventType,
 		ApprovalCode: approvalCode, InstanceCode: instanceCode,
