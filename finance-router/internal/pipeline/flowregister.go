@@ -224,10 +224,19 @@ func buildFlowRegisterForm(cfg *config.Config, info *purchaseInfo, it purchaseIt
 			notes = append(notes, fmt.Sprintf("支出金额 = %.2f", amt))
 		}
 	}
+	// ★ 转账日期只在**当天**才预填：该表单的日期控件带范围校验（dateCheckType），
+	//   实测把昨天的日期塞进去会被拒：`1390001 date: 2026-09-21 out of range`
+	//   （2026-09-22 建单时踩到）。而且"转账日期"本来是登记人知道、我们不知道的信息，
+	//   留空让他填比猜一个错的好。
 	if id := ctrl("date"); id != "" && finishMS > 0 {
-		form = append(form, map[string]any{"id": id, "type": "date",
-			"value": time.UnixMilli(finishMS).Format(time.RFC3339)})
-		notes = append(notes, "转账日期 = "+time.UnixMilli(finishMS).Format("2006-01-02"))
+		t := time.UnixMilli(finishMS)
+		if sameDay(t, time.Now()) {
+			form = append(form, map[string]any{"id": id, "type": "date", "value": t.Format(time.RFC3339)})
+			notes = append(notes, "转账日期 = "+t.Format("2006-01-02"))
+		} else {
+			notes = append(notes, fmt.Sprintf("转账日期留空（采购完成于 %s，不是今天；表单对过去的日期报 out of range）",
+				t.Format("2006-01-02")))
+		}
 	}
 	if id := ctrl("note"); id != "" {
 		if n := ledgerNote(info, it); n != "" {
@@ -262,6 +271,12 @@ func createFlowRegisterDraft(ctx context.Context, cfg *config.Config, client *fe
 		AllowResubmit: true,
 	}
 	newCode, err := client.CreateInstance(ctx, req)
+	if err != nil && isDateRangeErr(err) {
+		// 自愈：日期控件被表单的范围校验拒了 → 去掉该项再试（登记人自己填日期）
+		req.Form = dropFormField(req.Form, cfg.Control(config.RoleLedgerRegister, "date"))
+		fmt.Println("  ↻ 转账日期被表单拒了（out of range），去掉该预填项重试")
+		newCode, err = client.CreateInstance(ctx, req)
+	}
 	if err != nil && strings.Contains(err.Error(), "60012") {
 		// UUID 冲突 = 这个幂等键**已经被用过**（例如上一张单建出来了但没退回去，
 		// 本地换了 uuid 重建却撞上了历史键）。换一个带时间戳的 uuid 再试一次：
@@ -454,6 +469,35 @@ func RunFlowRegister(ctx context.Context, opts FlowRegisterOptions) error {
 	}
 	fmt.Printf("✓ 流水登记 %s 处理完成（流水行 %s）\n", short(opts.Instance), ledgerRecID)
 	return nil
+}
+
+// isDateRangeErr 判断建单失败是不是"日期超出表单允许范围"。
+func isDateRangeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := err.Error()
+	return strings.Contains(m, "out of range") || (strings.Contains(m, "date") && strings.Contains(m, "1390001"))
+}
+
+// dropFormField 从表单里去掉某个控件（用于"某项被表单拒了就退一步"）。
+func dropFormField(form []map[string]any, id string) []map[string]any {
+	if id == "" {
+		return form
+	}
+	out := make([]map[string]any, 0, len(form))
+	for _, f := range form {
+		if v, _ := f["id"].(string); v == id {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+// sameDay 判断两个时间是不是同一个自然日（本地时区）。
+func sameDay(a, b time.Time) bool {
+	return a.Year() == b.Year() && a.YearDay() == b.YearDay()
 }
 
 // ledgerOverwriteFields 组"按登记数据覆盖流水行"的字段。

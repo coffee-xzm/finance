@@ -26,7 +26,11 @@ type FlowRegisterSync struct {
 const (
 	FlowRegisterAwaiting = "awaiting_applicant" // 已代建并退回给登记人
 	FlowRegisterApplied  = "applied"            // 数据已覆盖到流水行
-	FlowRegisterFailed   = "failed"
+	FlowRegisterFailed   = "failed"             // 建单就没成功（可重试）
+	// FlowRegisterBlocked 表示"单建出来了、但退不回给登记人"（例如审批节点配成
+	// 「自动通过」，没有待办任务可回退）——这是**定义侧的问题**，自动重试只会
+	// 每 10 分钟多建一张作废单，所以只等人改完定义后手动补跑。
+	FlowRegisterBlocked = "blocked"
 )
 
 // UpsertFlowRegister 写入/更新一张登记单的留痕。

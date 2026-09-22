@@ -252,13 +252,16 @@ func RunPurchase(ctx context.Context, opts PurchaseOptions) error {
 	switch {
 	case useRegister:
 		created := 0
-		var itemErrs []string
+		var itemErrs, blockedErrs []string
 		for i, it := range info.Items {
 			uuid := fmt.Sprintf("%s-%d", info.InstanceCode, i+1)
 			if registerCodes[i] != "" && !opts.Force {
 				// 上一张还"活着"就跳过；上一张**退回失败**（例如审批节点是自动通过、
 				// 单子已经废了）→ 换 uuid 重建一张，并把旧留痕丢掉，否则永远补不回来。
-				if r, ok, _ := db.GetFlowRegister(ctx, registerCodes[i]); !ok || r.State != store.FlowRegisterFailed {
+				// ★ blocked 状态不会被补漏扫描自动重试（否则每 10 分钟多建一张作废单），
+				//   所以这里的重建只在"人工补跑"时会走到。
+				if r, ok, _ := db.GetFlowRegister(ctx, registerCodes[i]); !ok ||
+					(r.State != store.FlowRegisterFailed && r.State != store.FlowRegisterBlocked) {
 					fmt.Printf("  = 明细 %d 的流水登记单已代建过（%s），跳过\n", i+1, short(registerCodes[i]))
 					continue
 				}
@@ -307,8 +310,10 @@ func RunPurchase(ctx context.Context, opts PurchaseOptions) error {
 			state := store.FlowRegisterAwaiting
 			lastErr := ""
 			if derr != nil {
-				state, lastErr = store.FlowRegisterFailed, derr.Error()
-				itemErrs = append(itemErrs, fmt.Sprintf("明细 %d: %v", i+1, derr))
+				// 建出来了但退不回去 = 审批定义侧的问题（blocked）：
+				// 不要交给补漏扫描自动重试，否则每轮都新建一张作废单。
+				state, lastErr = store.FlowRegisterBlocked, derr.Error()
+				blockedErrs = append(blockedErrs, fmt.Sprintf("明细 %d: %v", i+1, derr))
 			}
 			if err := db.UpsertFlowRegister(ctx, store.FlowRegisterSync{
 				InstanceCode:         code,
@@ -333,17 +338,24 @@ func RunPurchase(ctx context.Context, opts PurchaseOptions) error {
 			}
 			_ = notifyRegistrant(ctx, cfg, client, info, registerCodes, names)
 		}
-		if len(itemErrs) > 0 {
-			// 记状态再抛错：既有据可查，也让补漏扫描能重试（见 catchup.go）
+		if len(itemErrs) > 0 || len(blockedErrs) > 0 {
+			all := append(append([]string{}, itemErrs...), blockedErrs...)
+			// 状态口径：
+			//   failed  = 有单没建出来（网络/表单/日期等）→ 补漏扫描会自动重试
+			//   blocked = 单建出来了但没退回去（审批定义问题）→ 只人工补跑
+			state := "blocked"
+			if len(itemErrs) > 0 {
+				state = "failed"
+			}
 			_ = db.UpsertPurchase(ctx, store.PurchaseSync{
 				PurchaseInstanceCode: info.InstanceCode, ApprovalCode: info.ApprovalCode,
 				ApplicantUserID: info.ApplicantID, PurchaseStatus: status,
 				ProjectGroup: info.ProjectGroup, MirrorRecordID: mirrorID,
 				LedgerRecordIDs: ledgerIDs, RequestRecordIDs: requestIDs,
 				FlowRegisterCodes: registerCodes,
-				DraftState:        "failed", LastError: strings.Join(itemErrs, "; "),
+				DraftState:        state, LastError: strings.Join(all, "; "),
 			})
-			return fmt.Errorf("流水登记单有 %d 项没成功: %s", len(itemErrs), strings.Join(itemErrs, "; "))
+			return fmt.Errorf("流水登记单有 %d 项没成功（%s）: %s", len(all), state, strings.Join(all, "; "))
 		}
 	default:
 		if inv, ok := cfg.ApprovalByRole(config.RoleInvoiceCollect); ok && inv.Code != "" {

@@ -106,9 +106,10 @@ func (s *service) catchUpSweep(ctx context.Context) {
 					continue
 				}
 				if prev, ok, _ := s.db.GetPurchase(ctx, code); ok {
-					// 幂等锚点：处理过就别再碰。**例外**：上次中途失败
-					// （draft_state=failed，例如流水登记单没退回去）要重试，
-					// 否则那笔采购的登记单永远补不上（2026-09-21 实测踩到）。
+					// 幂等锚点：处理过就别再碰。**例外**：上次"建单失败"
+					// （draft_state=failed，多为网络/表单瞬时报错）要重试；
+					// 但 blocked（单建出来了、退回失败 = 审批定义问题）**不自动重试**，
+					// 否则每 10 分钟就多建一张作废单，等人工改完定义手动补跑。
 					if prev.DraftState != "failed" {
 						continue
 					}

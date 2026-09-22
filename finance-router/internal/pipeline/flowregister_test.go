@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -88,7 +89,9 @@ func TestBuildFlowRegisterForm(t *testing.T) {
 	info := &purchaseInfo{ProjectName: "耗材（接口焊锡洗板水）"}
 	it := purchaseItem{Name: "焊锡", Qty: 2, Amount: 31.45}
 
-	form, notes := buildFlowRegisterForm(cfg, info, it, 1789800000000)
+	// 转账日期：只有"当天"才预填（表单对过去的日期报 out of range）——
+	// 用 time.Now() 的毫秒值来测"当天"分支。
+	form, notes := buildFlowRegisterForm(cfg, info, it, time.Now().UnixMilli())
 	if len(form) != 4 || len(notes) != 4 {
 		t.Fatalf("应预填 4 项（类型/支出金额/日期/备注），实际 %d: %#v", len(form), form)
 	}
@@ -108,8 +111,8 @@ func TestBuildFlowRegisterForm(t *testing.T) {
 		t.Fatalf("转账日期控件缺失: %#v", d)
 	}
 	ms := dateValueMS(mustJSON(d["value"]))
-	if ms != 1789800000000 {
-		t.Errorf("转账日期 = %d，应为采购完成时间 1789800000000", ms)
+	if !sameDay(time.UnixMilli(ms), time.Now()) {
+		t.Errorf("转账日期 = %d，应为采购完成时间（当天）", ms)
 	}
 	if n := formItem(t, form, C("note")); n == nil || n["value"] != "耗材（接口焊锡洗板水） ｜ 焊锡 ×2" {
 		t.Errorf("备注 = %#v", n)
@@ -118,6 +121,34 @@ func TestBuildFlowRegisterForm(t *testing.T) {
 	if formItem(t, form, C("source")) != nil || formItem(t, form, C("destination")) != nil ||
 		formItem(t, form, C("screenshot")) != nil {
 		t.Error("金额来源/金额去向/转账截图不应预填")
+	}
+
+	// 不是当天（例如采购是昨天通过的）→ 不预填日期，避免 1390001 out of range
+	old, _ := time.Parse(time.RFC3339, "2026-09-21T15:04:05+08:00")
+	form2, _ := buildFlowRegisterForm(cfg, info, it, old.UnixMilli())
+	if formItem(t, form2, C("date")) != nil {
+		t.Error("采购完成时间不是当天时不应预填转账日期（表单会拒）")
+	}
+	if formItem(t, form2, C("expense_amount")) == nil || formItem(t, form2, C("note")) == nil {
+		t.Error("不预填日期时其它项仍要预填")
+	}
+}
+
+// TestDropFormField / TestIsDateRangeErr 自愈路径：日期被表单拒 → 去掉该项重试。
+func TestDropFormField(t *testing.T) {
+	form := []map[string]any{{"id": "a"}, {"id": "b"}, {"id": "c"}}
+	got := dropFormField(form, "b")
+	if len(got) != 2 || got[0]["id"] != "a" || got[1]["id"] != "c" {
+		t.Errorf("dropFormField = %#v", got)
+	}
+	if len(dropFormField(form, "")) != 3 {
+		t.Error("空 id 不应改动表单")
+	}
+	if !isDateRangeErr(fmt.Errorf("HTTP 400 code=1390001 msg=date: 2026-09-21 out of range")) {
+		t.Error("应识别出日期超范围错误")
+	}
+	if isDateRangeErr(fmt.Errorf("HTTP 400 code=1390001 msg=其他错误")) {
+		t.Error("不该把其它 1390001 当成日期错误")
 	}
 }
 
