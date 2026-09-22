@@ -377,9 +377,24 @@ func buildRegisterNotice(cfg *config.Config, info *purchaseInfo) string {
 	fmt.Fprintf(&b, "\n\n采购审批：%s\n", buildApprovalApplink(cfg, info.InstanceCode))
 	b.WriteString("\n填法：类型选「支出」，金额照上面填；转账日期填实际转账日；上传转账截图；" +
 		"金额来源/金额去向按实际选。\n" +
-		"提交即通过 —— 系统靠**备注**把这笔登记对到「27 - 收支表」对应行并覆盖，" +
+		"提交即通过 —— 系统靠「备注」把这笔登记对到「27 - 收支表」对应行并覆盖，" +
 		"该采购全部明细登记完成后会给采购提交人开「27发票收集」。")
 	return b.String()
+}
+
+// PreviewRegisterNotice 只读预览：notify 模式下会发给登记人的那段文字
+// （运维入口 cmd/purchase -notice <采购实例code>，用来核对格式/重发前看一眼）。
+func PreviewRegisterNotice(ctx context.Context, cfg *config.Config, instanceCode string) (string, error) {
+	client := feishu.NewClient(cfg.Feishu.BaseURL, cfg.Feishu.AppID, cfg.Feishu.AppSecret)
+	det, _, err := client.GetInstanceDetail(ctx, instanceCode)
+	if err != nil {
+		return "", fmt.Errorf("读采购实例 %s: %w", short(instanceCode), err)
+	}
+	info, err := parsePurchase(det)
+	if err != nil {
+		return "", err
+	}
+	return buildRegisterNotice(cfg, info), nil
 }
 
 // trimNum 打印数量/单价时不带多余小数位。

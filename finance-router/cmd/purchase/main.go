@@ -35,6 +35,8 @@ func main() {
 	resync := flag.Bool("resync-request", false, "按「只填空」补正已写的采购申请表行（如补发起人部门）")
 	resyncLedger := flag.Bool("resync-ledger", false,
 		"按「只填空」补正已写的**流水行**（如线上新增的「关联人」列）")
+	notice := flag.Bool("notice", false,
+		"只打印 notify 模式会私信给流水登记人的那段文字（不写、不发）")
 	flag.Parse()
 	if *instance == "" {
 		fmt.Fprintln(os.Stderr, "✗ 必须给 -instance <采购实例code>")
@@ -81,6 +83,15 @@ func main() {
 			fmt.Fprintf(os.Stderr, "✗ %v\n", err)
 			os.Exit(1)
 		}
+		return
+	}
+	if *notice {
+		text, err := pipeline.PreviewRegisterNotice(ctx, cfg, *instance)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(text)
 		return
 	}
 	if *resync {
